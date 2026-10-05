@@ -9,6 +9,19 @@ visible terminals. Run the same BAT again after Windows updates to reapply
 tweaks/remove returned bloatware and update apps. Existing Office is updated,
 not reinstalled. Close Office apps for updates and reboot only after all workers
 and vendor installers finish. Reports are under ProgramData\FreshWindowsSetup.
+
+Created/customized by GZ / 4pp4cc. Support: https://ko-fi.com/gzred
+Project: https://github.com/4pp4cc/fresh-windows-setup
+Credits: Raphire/Win11Debloat, Glenn Delahoy (SDIO), the original SDI project,
+and the respective software vendors. These projects are independent.
+WARNING: This script changes Windows settings, removes apps (including Xbox
+and OneDrive), installs drivers/software and launches the requested remote
+command. Review it first and keep a separate backup of important files.
+A restore point is required but is not a full backup. Provided AS IS with no
+guarantee or warranty. GPU signature checks may be bypassed for official
+vendor downloads as requested. Performance settings increase battery use.
+Installed uBlock extensions are left alone; setup no longer installs them.
+SDIO/SDI downloads are deleted after the final driver retry/finish selection.
 #>
 [CmdletBinding()]
 param(
@@ -201,33 +214,6 @@ function Set-PowerProfile {
     Write-Host "Profile $choice applied. Critical-battery protections are preserved."
 }
 
-function Open-BraveUBlockSetup {
-    $brave = @(
-        (Join-Path $env:ProgramFiles 'BraveSoftware\Brave-Browser\Application\brave.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'BraveSoftware\Brave-Browser\Application\brave.exe'),
-        (Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\Application\brave.exe')
-    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    if (-not $brave) { throw 'Brave executable not found.' }
-    $userData = Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\User Data'
-    $profiles = @(Get-ChildItem -LiteralPath $userData -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
-    foreach ($profile in $profiles) {
-        foreach ($id in @('jcokkipkhhgiakinbnnplhkdbjbgcgpe','cjpalhdlnbpafiamejdnhcphjbkeiagm')) {
-            if (Test-Path -LiteralPath (Join-Path $profile.FullName "Extensions\$id")) {
-                Write-Host 'uBlock Origin files are already present. Check its enabled state in Brave if needed.'
-                return
-            }
-        }
-    }
-    Start-Process -FilePath $brave -ArgumentList 'brave://settings/extensions/v2'
-    Write-Host 'In the Brave page just opened, switch uBlock Origin ON and accept its installation prompt.'
-    Write-Host 'Brave hosts the full Manifest V2 extension; its old Chrome Web Store force-install link is no longer reliable.'
-    Read-Host 'After enabling uBlock Origin, press Enter here to continue' | Out-Null
-    $found = Get-ChildItem -LiteralPath $userData -Filter manifest.json -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match '\\Extensions\\(jcokkipkhhgiakinbnnplhkdbjbgcgpe|cjpalhdlnbpafiamejdnhcphjbkeiagm)\\' } |
-        Select-Object -First 1
-    if (-not $found) { throw 'uBlock Origin installation was not detected. Enable it at brave://settings/extensions/v2.' }
-}
 
 function Invoke-DriverExclusive {
     param([scriptblock]$Action)
@@ -311,6 +297,43 @@ function Invoke-SdioScript {
     if ($code -ne 0 -or $output -match 'FRESH_SETUP_SDIO_FAILED' -or $output -notmatch 'FRESH_SETUP_SDIO_SUCCESS') {
         throw "SDIO $Phase failed or crashed. Log: $log"
     }
+}
+
+function Remove-DriverToolFiles {
+    $setupRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'FreshWindowsSetup'))
+    $cacheRoot = [IO.Path]::GetFullPath((Join-Path $setupRoot 'DriverTools'))
+    if (-not (Test-Path -LiteralPath $cacheRoot)) { return }
+    $resolved = (Resolve-Path -LiteralPath $cacheRoot).ProviderPath
+    if (-not [string]::Equals($resolved, $cacheRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $resolved.StartsWith($setupRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Driver cleanup target is outside the expected setup cache.'
+    }
+    # Never follow a junction/symlink outside this setup-owned cache.
+    foreach ($path in @($env:ProgramData, $setupRoot, $cacheRoot)) {
+        if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Driver cleanup refuses linked folders: $path"
+        }
+    }
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($cacheRoot)
+    while ($pending.Count) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $pending.Pop() -Force)) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Driver cleanup refuses a linked item: $($item.FullName)"
+            }
+            if (-not $item.FullName.StartsWith($cacheRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Unexpected driver cleanup child path.'
+            }
+            if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+        }
+    }
+    $running = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($cacheRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($running.Count) { throw 'SDIO/SDI is still open. Close it before deleting its cache.' }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+    if (Test-Path -LiteralPath $cacheRoot) { throw 'SDIO/SDI cache remains; review the cleanup error.' }
+    Write-Host 'Removed SDIO/SDI executables, archives, indexes and downloaded driver packs. Installed drivers are retained.'
 }
 
 function Invoke-DriverWorkflow {
@@ -448,6 +471,13 @@ function Install-WingetApp {
 
 try {
     if ($Worker -eq 'Coordinator') {
+    Write-Host 'Fresh Windows Setup - GZ / 4pp4cc' -ForegroundColor Cyan
+    Write-Host 'Project: https://github.com/4pp4cc/fresh-windows-setup'
+    Write-Host 'Support / Ko-Fi: https://ko-fi.com/gzred'
+    Write-Host 'Credits: Raphire/Win11Debloat, Glenn Delahoy/SDIO, original SDI and software vendors.'
+    Write-Warning 'AS IS, without guarantee or warranty. Keep a backup: a restore point is not a full backup.'
+    Write-Warning 'Setup removes apps, changes settings, installs drivers and runs the requested final remote command.'
+    Write-Warning 'Official GPU signature-check failures may be bypassed. Performance settings increase battery use.'
     Invoke-Step 'Restore point and desktop registry backups' {
         $backupIndex = 0
         foreach ($key in @(
@@ -622,7 +652,6 @@ namespace FreshWindowsSetup {
             '7zip.7zip', 'Ditto.Ditto', 'ALCPU.CoreTemp',
             'Geeks3D.FurMark.2', 'Skillbrains.Lightshot', 'IObit.IObitUnlocker'
         )) { Invoke-Step "Install/update $id" { Install-WingetApp $id } }
-        Invoke-Step 'Enable full uBlock Origin in Brave' { Open-BraveUBlockSetup }
         Invoke-Step 'Install/update RustDesk from official release' {
             $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/rustdesk/rustdesk/releases/latest'
             $asset = $release.assets | Where-Object { $_.name -match '^rustdesk-.*-x86_64\.msi$' } |
@@ -811,11 +840,15 @@ namespace FreshWindowsSetup {
     Write-Warning $_.Exception.Message
     $script:Results.Add([pscustomobject]@{Step="$Worker fatal error";Status='Needs attention';Detail=$_.Exception.Message})
 } finally {
+    if ($Worker -eq 'Drivers' -and -not $SkipDrivers) {
+        Invoke-Step 'Delete SDIO and SDI downloads after finishing drivers' { Remove-DriverToolFiles }
+    }
     $reportName = if ($Worker -eq 'Coordinator') { 'report.csv' } else { 'report-' + $Worker + '.csv' }
     $script:Results | Export-Csv -Path (Join-Path $runDir $reportName) -NoTypeInformation -Encoding UTF8
     $script:Results | Format-Table -AutoSize
     Write-Host "`nLogs, backups and report: $runDir"
     if ($Worker -eq 'Coordinator') {
+        Write-Host 'Created by GZ / 4pp4cc - Support / Ko-Fi: https://ko-fi.com/gzred'
         $issues = @($script:Results | Where-Object Status -eq 'Needs attention')
         if ($issues.Count) { Write-Warning "$($issues.Count) step(s) need attention. Review report.csv." }
         else { Write-Host 'All recorded setup steps finished.' -ForegroundColor Green }
