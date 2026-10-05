@@ -32,6 +32,7 @@ param(
     [switch]$SkipNetTime,
     [switch]$SkipDrivers,
     [switch]$SkipFinalCommand,
+    [switch]$CleanSetupFiles,
     [ValidateSet('Coordinator','Apps','Office','Drivers')][string]$Worker = 'Coordinator',
     [string]$RunRoot
 )
@@ -867,5 +868,33 @@ namespace FreshWindowsSetup {
     }
 }
 Read-Host 'This terminal finished. Press Enter to close it' | Out-Null
+if ($Worker -eq 'Coordinator' -and $CleanSetupFiles) {
+    try {
+        $expectedParent = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'FreshWindowsSetup'))
+        $target = (Resolve-Path -LiteralPath $runDir).ProviderPath
+        if ((Split-Path $target -Parent) -ne $expectedParent -or
+            (Split-Path $target -Leaf) -notmatch '^\d{8}-\d{6}-\d+$') {
+            throw 'Unexpected setup cleanup path.'
+        }
+        foreach ($path in @($env:ProgramData, $expectedParent, $target)) {
+            if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Setup cleanup refuses linked folders.'
+            }
+        }
+        $pending = New-Object 'Collections.Generic.Stack[string]'
+        $pending.Push($target)
+        while ($pending.Count) {
+            foreach ($item in @(Get-ChildItem -LiteralPath $pending.Pop() -Force)) {
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Setup cleanup refuses linked items.' }
+                if (-not $item.FullName.StartsWith($target + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected cleanup child.' }
+                if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+            }
+        }
+        Remove-Item -LiteralPath $target -Recurse -Force
+    } catch {
+        Write-Warning "Setup temporary-file cleanup failed: $($_.Exception.Message)"
+        exit 1
+    }
+}
 if (@($script:Results | Where-Object Status -eq 'Needs attention').Count -gt 0) { exit 1 }
 exit 0
