@@ -350,15 +350,18 @@ function Set-ExtraCleanup {
     Write-Host '0) Keep defaults'
     Write-Host '1) Reduce interface effects'
     Write-Host '2) Reduce effects AND remove new Outlook, Phone Link and Get Help (including app data)'
-    Write-Host 'Defender, Windows Update, Store, search indexing and the page file stay enabled.'
-    do { $choice = Read-Host 'Choose 0, 1 or 2' } until ($choice -in @('0','1','2'))
+    Write-Host '3) RADICAL: option 2 + disable Defender real-time protection, Windows Update and indexing; restrict Store'
+    Write-Host 'Options 0/1/2 keep security services. They do not undo an earlier radical preset.'
+    Write-Warning 'Option 3 reduces protection and automatic maintenance; future update/driver scans may need services re-enabled. Faster performance is not guaranteed.'
+    do { $choice = Read-Host 'Choose 0, 1, 2 or 3' } until ($choice -in @('0','1','2','3'))
+    $script:RadicalRequested = $choice -eq '3'
     if ($choice -eq '0') { return }
     Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'EnableTransparency' 0
     Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarAnimations' 0
     $metrics = 'HKCU:\Control Panel\Desktop\WindowMetrics'
     if (-not (Test-Path -LiteralPath $metrics)) { New-Item -Path $metrics -Force | Out-Null }
     New-ItemProperty -Path $metrics -Name 'MinAnimate' -Value '0' -PropertyType String -Force | Out-Null
-    if ($choice -eq '2') {
+    if ($choice -in @('2','3')) {
         foreach ($name in @('Microsoft.OutlookForWindows','Microsoft.YourPhone','Microsoft.GetHelp')) {
             Invoke-Step "Optional removal: $name" {
                 Get-AppxPackage -AllUsers -Name $name | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers }
@@ -368,6 +371,54 @@ function Set-ExtraCleanup {
         }
     }
     Write-Host 'Extra settings applied. Sign out/restart to refresh all interface effects.'
+    if ($script:RadicalRequested) { Write-Host 'Radical service changes are queued until apps and drivers finish.' }
+}
+
+function Set-RadicalPreset {
+    $stateFolder = Join-Path $env:ProgramData 'FreshWindowsSetup\State'
+    if (-not (Test-Path -LiteralPath $stateFolder)) { New-Item -ItemType Directory -Path $stateFolder -Force | Out-Null }
+    if ((Get-Item -LiteralPath $stateFolder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Radical backup folder cannot be a link.' }
+    $backupPath = Join-Path $stateFolder 'radical-before.json'
+    if (-not (Test-Path -LiteralPath $backupPath)) {
+        $services = @(Get-CimInstance Win32_Service | Where-Object Name -in @('wuauserv','UsoSvc','WSearch') |
+            Select-Object Name,StartMode,State)
+        $defender = Get-MpPreference -ErrorAction SilentlyContinue
+        $store = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' -ErrorAction SilentlyContinue
+        $updates = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue
+        [pscustomobject]@{Saved=(Get-Date).ToString('o');Services=$services;
+            DefenderDisableRealtimeMonitoring=$defender.DisableRealtimeMonitoring;
+            StoreRemoveWindowsStore=$store.RemoveWindowsStore;StoreAutoDownload=$store.AutoDownload;
+            UpdatesNoAutoUpdate=$updates.NoAutoUpdate} | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $backupPath -Encoding UTF8
+    }
+    Write-Host "Original radical settings retained: $backupPath"
+    Invoke-Step 'Radical: disable Defender real-time protection' {
+        Set-MpPreference -DisableRealtimeMonitoring $true
+        if ((Get-MpComputerStatus).RealTimeProtectionEnabled) { throw 'Windows/Tamper Protection kept Defender active. No protection bypass was attempted.' }
+        Write-Warning 'Real-time protection disabled. Windows may automatically re-enable it.'
+    }
+    Invoke-Step 'Radical: disable automatic Windows Update' {
+        Set-Dword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoUpdate' 1
+        foreach ($name in @('wuauserv','UsoSvc')) {
+            if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+                Set-Service -Name $name -StartupType Disabled
+                Stop-Service -Name $name -Force
+                $current = Get-CimInstance Win32_Service -Filter "Name='$name'"
+                if ($current.StartMode -ne 'Disabled' -or $current.State -ne 'Stopped') { throw "$name could not be disabled/stopped." }
+            }
+        }
+    }
+    Invoke-Step 'Radical: restrict Microsoft Store and automatic Store updates' {
+        Set-Dword 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'RemoveWindowsStore' 1
+        Set-Dword 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'AutoDownload' 2
+        Write-Warning 'Store restriction policies depend on Windows edition; installed Store apps and App Installer are retained.'
+    }
+    Invoke-Step 'Radical: disable Windows Search indexing' {
+        Set-Service -Name WSearch -StartupType Disabled
+        Stop-Service -Name WSearch -Force
+        $current = Get-CimInstance Win32_Service -Filter "Name='WSearch'"
+        if ($current.StartMode -ne 'Disabled' -or $current.State -ne 'Stopped') { throw 'Search indexing could not be disabled/stopped.' }
+    }
 }
 
 function Set-PowerProfile {
@@ -1075,6 +1126,7 @@ namespace FreshWindowsSetup {
         Invoke-Step 'Uninstall OneDrive' { Remove-OneDrive }
         Invoke-Step 'Uninstall Xbox components' { Remove-Xbox }
         Invoke-Step 'Disable unwanted startup programs' { Disable-UnwantedStartup }
+        if ($script:RadicalRequested) { Invoke-Step 'Apply selected radical preset after installations' { Set-RadicalPreset } }
         Invoke-Step 'Refresh File Explorer and dark mode' {
             # Reapply after installers, which can modify desktop preferences.
             Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 0
