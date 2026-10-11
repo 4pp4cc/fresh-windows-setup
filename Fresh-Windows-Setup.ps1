@@ -289,9 +289,13 @@ function Test-OfficialDriverUrl {
     try {
         $uri = [uri]$Url
         if ($uri.Scheme -ne 'https' -or $uri.UserInfo) { return $false }
+        if ($uri.Host -in @('github.com','raw.githubusercontent.com') -and
+            $uri.AbsolutePath -match '^/coolstar/driverinstallers(?:/|$)') { return $true }
+        if ($uri.Host -in @('answers.microsoft.com','www.answers.microsoft.com','apps.microsoft.com')) { return $false }
+        if ($uri.Host -eq 'www.microsoft.com' -and $uri.AbsolutePath -match 'microsoft-365|outlook|log-in') { return $false }
         foreach ($domain in @('dell.com','hp.com','lenovo.com','asus.com','acer.com','msi.com',
             'gigabyte.com','asrock.com','intel.com','amd.com','nvidia.com','realtek.com',
-            'realtek.com.tw','qualcomm.com','mediatek.com','microsoft.com','surface.com')) {
+            'realtek.com.tw','qualcomm.com','mediatek.com','microsoft.com','surface.com','coolstar.org','coolstar.moe')) {
             if ($uri.Host -eq $domain -or $uri.Host.EndsWith('.' + $domain)) { return $true }
         }
     } catch { }
@@ -312,8 +316,86 @@ function Test-InfHardwareMatch {
     return $false
 }
 
+function Get-DriverSearchQueries {
+    param([string[]]$Ids,[string]$Context)
+    $queries = @($Ids | Select-Object -First 2 | ForEach-Object { '"' + $_ + '" driver' })
+    # Keep punctuation and device IDs intact. Model information is only a fallback.
+    if ($Context) { $queries += '"' + ($Ids[0] -split '\\')[-1] + '" driver ' + $Context }
+    return @($queries | Select-Object -Unique)
+}
+
+function Install-MatchingInfDrivers {
+    param([string]$Folder,[string[]]$Ids)
+    if (@(Get-ChildItem -LiteralPath $Folder -Recurse -Force |
+        Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) { throw 'Candidate contains linked files.' }
+    foreach ($inf in @(Get-ChildItem -LiteralPath $Folder -Filter '*.inf' -Recurse -File)) {
+        $text = Get-Content -LiteralPath $inf.FullName -Raw
+        if (-not (Test-InfHardwareMatch $text $Ids)) { continue }
+        $catalogs = @([regex]::Matches($text, '(?im)^\s*CatalogFile(?:\.[^=\s]+)?\s*=\s*([^;\r\n]+)') |
+            ForEach-Object { $_.Groups[1].Value.Trim().Trim('"') })
+        $valid = $false
+        foreach ($name in $catalogs) {
+            if ([IO.Path]::GetFileName($name) -ne $name) { continue }
+            $catalog = Join-Path $inf.DirectoryName $name
+            if ((Test-Path -LiteralPath $catalog) -and (Get-AuthenticodeSignature -LiteralPath $catalog).Status -eq 'Valid') { $valid = $true }
+        }
+        if (-not $valid) { Write-Warning "Matching INF has no verified catalog: $($inf.Name)"; continue }
+        Write-Host "Matching signed driver candidate: $($inf.FullName)"
+        Invoke-DriverExclusive {
+            & "$env:SystemRoot\System32\pnputil.exe" /add-driver $inf.FullName /install | Out-Host
+            if ($LASTEXITCODE -notin @(0,3010)) { throw "PnPUtil rejected candidate ($LASTEXITCODE)." }
+            if ($LASTEXITCODE -eq 3010) { Write-Warning 'Driver requires a restart after setup.' }
+        }
+    }
+}
+
+function Invoke-VerifiedPublisherDrivers {
+    param([string[]]$Ids,[string]$Cache)
+    # Publisher adapter: inspect INF IDs across the repository, not a particular board.
+    if (-not ($Ids -match '^ACPI\\(?:VEN_GOOG|GOOG)')) { return }
+    $root = Join-Path $Cache 'CoolStar'
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    if ((Get-Item -LiteralPath $root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Publisher cache cannot be a link.' }
+    if (-not $script:PublisherInfIndex) {
+        Write-Host 'Reading CoolStar publisher INF index directly from GitHub; no search engine required.'
+        $commit = Invoke-RestMethod 'https://api.github.com/repos/coolstar/driverinstallers/commits/master'
+        if ($commit.sha -notmatch '^[a-fA-F0-9]{40}$') { throw 'Invalid publisher commit.' }
+        $script:PublisherRevision = $commit.sha
+        $tree = Invoke-RestMethod ('https://api.github.com/repos/coolstar/driverinstallers/git/trees/' + $commit.commit.tree.sha + '?recursive=1')
+        if ($tree.truncated -or $tree.sha -notmatch '^[a-fA-F0-9]{40}$') { throw 'Incomplete/invalid publisher index.' }
+        $script:PublisherTree = $tree
+        $index = @()
+        foreach ($entry in @($tree.tree | Where-Object { $_.type -eq 'blob' -and $_.path -match '\.inf$' -and $_.size -lt 200000 })) {
+            $url = 'https://raw.githubusercontent.com/coolstar/driverinstallers/' + $script:PublisherRevision + '/' + $entry.path
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 30
+            $index += [pscustomobject]@{Path=$entry.path;Text=$response.Content}
+        }
+        $script:PublisherInfIndex = $index
+    }
+    $matches = @($script:PublisherInfIndex | Where-Object { Test-InfHardwareMatch $_.Text $Ids })
+    Write-Host "Publisher index: $($matches.Count) INF file(s) match current hardware IDs."
+    foreach ($directory in @($matches | ForEach-Object { $_.Path.Substring(0,$_.Path.LastIndexOf('/')) } | Select-Object -Unique)) {
+        $folder = Join-Path $root $directory.Replace('/','\')
+        $ready = Join-Path $folder 'download-ready.txt'
+        if (-not (Test-Path -LiteralPath $ready)) {
+            foreach ($entry in @($script:PublisherTree.tree | Where-Object {
+                $_.type -eq 'blob' -and $_.path.StartsWith($directory + '/') -and $_.path -match '\.(inf|cat|sys|dll|bin|dat)$' })) {
+                $target = [IO.Path]::GetFullPath((Join-Path $root $entry.path.Replace('/','\')))
+                if (-not $target.StartsWith($root + '\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe publisher path.' }
+                $parent = Split-Path $target -Parent
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                $url = 'https://raw.githubusercontent.com/coolstar/driverinstallers/' + $script:PublisherRevision + '/' + $entry.path
+                Write-Host "Publisher package file: $($entry.path)"
+                Get-Download $url $target
+            }
+            Set-Content -LiteralPath $ready -Value $script:PublisherRevision
+        } else { Write-Host 'Reusing publisher package downloaded earlier in this run.' }
+        Install-MatchingInfDrivers $folder $Ids
+    }
+}
+
 function Get-DriverSearchPages {
-    param([string]$Query)
+    param([string]$Query,[string[]]$Ids)
     if (-not $script:DriverSearchCache) { $script:DriverSearchCache = @{} }
     if ($script:DriverSearchCache.ContainsKey($Query)) { return $script:DriverSearchCache[$Query] }
     foreach ($provider in @('Brave API','Bing RSS','DuckDuckGo HTML')) {
@@ -341,7 +423,21 @@ function Get-DriverSearchPages {
                         ForEach-Object { [uri]::UnescapeDataString($_.Groups[1].Value) })
                 }
             }
-            $pages = @($urls | Where-Object { Test-OfficialDriverUrl $_ } | Select-Object -Unique -First 4)
+            $pages = @($urls | Select-Object -Unique -First 8 | Where-Object {
+                if (-not (Test-OfficialDriverUrl $_)) { return $false }
+                # Provider URLs alone are insufficient: require hardware-ID relevance in the page.
+                try {
+                    $pageResponse = Invoke-WebRequest -UseBasicParsing -Uri $_ -TimeoutSec 20
+                    $content = [Net.WebUtility]::HtmlDecode($pageResponse.Content)
+                    $relevant = $false
+                    foreach ($id in $Ids) {
+                        $suffix = ($id -split '\\')[-1]
+                        if ($content.IndexOf($id,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                            $content.IndexOf($suffix,[StringComparison]::OrdinalIgnoreCase) -ge 0) { $relevant = $true }
+                    }
+                    $relevant -and (Test-OfficialDriverUrl $pageResponse.BaseResponse.ResponseUri.AbsoluteUri)
+                } catch { $false }
+            } | Select-Object -Unique -First 4)
             if ($pages.Count) { $script:DriverSearchCache[$Query] = $pages; return $pages }
             Write-Host "$provider returned no supported manufacturer links; trying the next source."
         } catch {
@@ -357,7 +453,7 @@ function Invoke-AutomaticWebDrivers {
     Show-DriverProblems
     Invoke-DriverRescan
     Write-Host 'Searching the internet by hardware ID. No SDI and no Windows Update API.'
-    Write-Host 'Supported automatic packages: manufacturer-hosted ZIP/CAB archives with matching signed INF drivers. Unsupported/blocked downloads remain unresolved.'
+    Write-Host 'Supported automatic packages: publisher INF packages and ZIP/CAB archives with matching signed drivers. Unsupported/blocked downloads remain unresolved.'
     $computer = Get-CimInstance Win32_ComputerSystem
     $context = "$($computer.Manufacturer) $($computer.Model)"
     $cache = Join-Path $env:ProgramData 'FreshWindowsSetup\DriverTools\HardwareWeb'
@@ -369,16 +465,20 @@ function Invoke-AutomaticWebDrivers {
     if (-not $script:WebDriverSeen) { $script:WebDriverSeen = @{} }
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
         Where-Object { $_.ConfigManagerErrorCode -ne 22 })
+    $allIds = @($devices | ForEach-Object { $_.HardwareID } | Where-Object { $_ } | Select-Object -Unique)
+    try { Invoke-VerifiedPublisherDrivers $allIds $cache } catch { Write-Warning "Publisher matching failed: $($_.Exception.Message)" }
+    Invoke-DriverRescan
+    $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
+        Where-Object { $_.ConfigManagerErrorCode -ne 22 })
     foreach ($device in $devices) {
         $ids = @($device.HardwareID | Where-Object { $_ })
         if (-not $ids.Count) { Write-Warning "No hardware ID: $($device.Name)"; continue }
         Write-Host "`nSearching: $($device.Name) | $($ids[0]) | error $($device.ConfigManagerErrorCode)"
-        foreach ($id in @($ids | Select-Object -First 2)) {
+        foreach ($query in @(Get-DriverSearchQueries $ids $context)) {
             try {
-                $query = ($id -replace '[\\&_]',' ') + ' driver Windows 11 ' + $context
                 Write-Host "Web query: $query"
-                $pages = @(Get-DriverSearchPages $query)
-                if (-not $pages.Count) { Write-Warning "No supported manufacturer search results for $id." }
+                $pages = @(Get-DriverSearchPages $query $ids)
+                if (-not $pages.Count) { Write-Warning "No relevant supported publisher results for $($ids[0])." }
                 foreach ($page in $pages) {
                     Write-Host "Manufacturer result: $page"
                     $urls = @()
@@ -423,31 +523,11 @@ function Invoke-AutomaticWebDrivers {
                                 }
                                 $script:WebDriverSeen[$url] = $folder
                             } else { $folder = $script:WebDriverSeen[$url]; Write-Host 'Reusing candidate already downloaded in this run.' }
-                            if (@(Get-ChildItem -LiteralPath $folder -Recurse -Force |
-                                Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) { throw 'Candidate contains linked files.' }
-                            foreach ($inf in @(Get-ChildItem -LiteralPath $folder -Filter '*.inf' -Recurse -File)) {
-                                $text = Get-Content -LiteralPath $inf.FullName -Raw
-                                if (-not (Test-InfHardwareMatch $text $ids)) { continue }
-                                $catalogs = @([regex]::Matches($text, '(?im)^\s*CatalogFile(?:\.[^=\s]+)?\s*=\s*([^;\r\n]+)') |
-                                    ForEach-Object { $_.Groups[1].Value.Trim().Trim('"') })
-                                $valid = $false
-                                foreach ($name in $catalogs) {
-                                    if ([IO.Path]::GetFileName($name) -ne $name) { continue }
-                                    $catalog = Join-Path $inf.DirectoryName $name
-                                    if ((Test-Path -LiteralPath $catalog) -and (Get-AuthenticodeSignature -LiteralPath $catalog).Status -eq 'Valid') { $valid = $true }
-                                }
-                                if (-not $valid) { Write-Warning "Matching INF has no verified catalog: $($inf.Name)"; continue }
-                                Write-Host "Matching signed driver candidate: $($inf.FullName)"
-                                Invoke-DriverExclusive {
-                                    & "$env:SystemRoot\System32\pnputil.exe" /add-driver $inf.FullName /install | Out-Host
-                                    if ($LASTEXITCODE -notin @(0,3010)) { throw "PnPUtil rejected candidate ($LASTEXITCODE)." }
-                                    if ($LASTEXITCODE -eq 3010) { Write-Warning 'Driver requires a restart after setup.' }
-                                }
-                            }
+                            Install-MatchingInfDrivers $folder $ids
                         } catch { Write-Warning "Candidate failed: $($_.Exception.Message)" }
                     }
                 }
-            } catch { Write-Warning "Internet search failed for $id : $($_.Exception.Message)" }
+            } catch { Write-Warning "Internet search failed for $($ids[0]) : $($_.Exception.Message)" }
         }
     }
     Invoke-DriverRescan
