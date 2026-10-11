@@ -21,7 +21,7 @@ A restore point is required but is not a full backup. Provided AS IS with no
 guarantee or warranty. GPU signature checks may be bypassed for official
 vendor downloads as requested. Performance settings increase battery use.
 Installed uBlock extensions are left alone; setup no longer installs them.
-SDIO/SDI downloads are deleted after the final driver retry/finish selection.
+SDIO/SDI downloads are retained through retries and deleted on driver terminal exit.
 #>
 [CmdletBinding()]
 param(
@@ -247,6 +247,7 @@ function Invoke-DriverRescan {
 }
 
 function Invoke-AutomaticWindowsDrivers {
+    Show-DriverProblems
     Write-Host 'Scanning installed hardware and searching Windows Update for applicable drivers...'
     Invoke-DriverRescan
     $session = New-Object -ComObject Microsoft.Update.Session
@@ -263,7 +264,7 @@ function Invoke-AutomaticWindowsDrivers {
         Write-Host "Driver: $($update.Title)"
         [void]$downloads.Add($update)
     }
-    if (-not $downloads.Count) { Write-Host 'Windows Update offered no unattended driver packages.'; return }
+    if (-not $downloads.Count) { Write-Host 'Windows Update offered no unattended driver packages.'; Show-DriverProblems; return }
     $downloader = $session.CreateUpdateDownloader()
     $downloader.Updates = $downloads
     $downloader.Priority = 3
@@ -293,6 +294,16 @@ function Invoke-AutomaticWindowsDrivers {
     if ($downloadFailures) { throw "$downloadFailures driver downloads failed; retry option 3." }
     Invoke-DriverRescan
     Write-Host 'Applicable unattended Windows Update drivers installed. No automatic reboot requested.'
+    Show-DriverProblems
+}
+
+function Show-DriverProblems {
+    $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
+        Where-Object { $_.ConfigManagerErrorCode -ne 22 })
+    Write-Host "`nMissing/problem drivers (28 = missing driver):"
+    if (-not $devices.Count) { Write-Host 'No enabled devices currently report a driver/device error.'; return }
+    $devices | Select-Object Name,@{Name='Error';Expression={$_.ConfigManagerErrorCode}},
+        @{Name='HardwareID';Expression={@($_.HardwareID)[0]}} | Format-Table -Wrap -AutoSize | Out-Host
 }
 
 function Set-ExtraCleanup {
@@ -383,6 +394,12 @@ function Invoke-DriverExclusive {
 
 function Get-DriverTool {
     param([ValidateSet('SDIO','SDI')][string]$Tool)
+    if (-not $script:DriverToolExecutables) { $script:DriverToolExecutables = @{} }
+    if ($script:DriverToolExecutables.ContainsKey($Tool) -and
+        (Test-Path -LiteralPath $script:DriverToolExecutables[$Tool])) {
+        Write-Host "Reusing downloaded $Tool and its existing indexes/driver packs."
+        return $script:DriverToolExecutables[$Tool]
+    }
     $cache = Join-Path $env:ProgramData "FreshWindowsSetup\DriverTools\$Tool"
     if (-not (Test-Path -LiteralPath $cache)) { New-Item -ItemType Directory -Path $cache -Force | Out-Null }
     if ($Tool -eq 'SDIO') {
@@ -423,6 +440,7 @@ function Get-DriverTool {
             Select-Object -First 1
     }
     if (-not $exe) { throw "No $Tool x64 executable found after extraction." }
+    $script:DriverToolExecutables[$Tool] = $exe.FullName
     return $exe.FullName
 }
 
@@ -503,23 +521,28 @@ function Remove-DriverToolFiles {
 
 function Invoke-DriverWorkflow {
     Write-Host "`nDriver method:"
-    Write-Host '1) SDIO automatic'
-    Write-Host '2) Original SDI'
+    Write-Host '1) SDIO automatic terminal'
+    Write-Host '2) SDIO graphical interface'
     Write-Host '3) Automatic Windows Update hardware-matched drivers'
-    do { $method = Read-Host 'Choose 1, 2 or 3' } until ($method -in @('1','2','3'))
-    $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDI' }; '3' { 'Windows Update' } }
+    Write-Host '4) Original SDI graphical interface'
+    do { $method = Read-Host 'Choose 1, 2, 3 or 4' } until ($method -in @('1','2','3','4'))
+    $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDIO' }; '3' { 'Windows Update' }; '4' { 'SDI' } }
     $automatic = $method -eq '1'
     do {
         try {
             if ($tool -eq 'Windows Update') { Invoke-AutomaticWindowsDrivers } else {
             $exe = Get-DriverTool $tool
             if ($tool -eq 'SDIO' -and $automatic) {
-                Write-Host 'Downloading all SDIO indexes first; driver packs are downloaded only for selected hardware.'
-                Invoke-SdioScript $exe 'indexes'
+                if (-not $script:SdioIndexesReady) {
+                    Write-Host 'Downloading SDIO indexes first; only selected hardware driver packs are downloaded.'
+                    Invoke-SdioScript $exe 'indexes'
+                    $script:SdioIndexesReady = $true
+                } else { Write-Host 'Reusing indexes already downloaded in this run.' }
                 Invoke-DriverExclusive { Invoke-SdioScript $exe 'install' }
             } else {
                 # GUI reopen is intentional: it lets the user check the result after a crash or install.
-                Write-Host 'In the driver tool, download indexes only, then select matching missing/newer/better drivers and Install.'
+                Write-Host 'Existing indexes and packs are retained. Download indexes only if absent/outdated.'
+                Write-Host 'In the driver tool, select matching missing/newer/better drivers and Install.'
                 Write-Host 'Do not restart until the entire setup has finished. Close the driver tool when done.'
                 Invoke-DriverExclusive {
                     $process = Start-Process -FilePath $exe -ArgumentList '-checkupdates' -WorkingDirectory (Split-Path $exe -Parent) -PassThru
@@ -529,15 +552,17 @@ function Invoke-DriverWorkflow {
             }
             }
         } catch { Write-Warning "$tool : $($_.Exception.Message)" }
+        if ($tool -eq 'Windows Update') { Show-DriverProblems }
         Write-Host "`n$tool has finished or closed. Are all drivers installed correctly?"
         Write-Host "1) Reopen the same tool ($tool) to check or retry."
         Write-Host '2) Switch between SDIO and original SDI.'
         Write-Host '3) Automatic Windows Update hardware-matched drivers.'
         Write-Host '4) Finish: drivers are OK.'
         Write-Host '5) Finish: some drivers still need attention.'
-        do { $choice = Read-Host 'Choose 1, 2, 3, 4 or 5' } until ($choice -in @('1','2','3','4','5'))
-        $automatic = $false
-        if ($choice -eq '2') { $tool = if ($tool -eq 'SDIO') { 'SDI' } else { 'SDIO' } }
+        Write-Host '6) Switch SDIO between automatic terminal and graphical interface'
+        do { $choice = Read-Host 'Choose 1, 2, 3, 4, 5 or 6' } until ($choice -in @('1','2','3','4','5','6'))
+        if ($choice -eq '2') { $tool = if ($tool -eq 'SDIO') { 'SDI' } else { 'SDIO' }; $automatic = $false }
+        if ($choice -eq '6') { $tool = 'SDIO'; $automatic = -not $automatic }
         if ($choice -eq '3') { $tool = 'Windows Update' }
         if ($choice -eq '5') { throw 'User reports incomplete driver installation. Re-run the driver workflow when ready.' }
     } while ($choice -notin @('4','5'))
@@ -1029,9 +1054,6 @@ namespace FreshWindowsSetup {
     Write-Warning $_.Exception.Message
     $script:Results.Add([pscustomobject]@{Step="$Worker fatal error";Status='Needs attention';Detail=$_.Exception.Message})
 } finally {
-    if ($Worker -eq 'Drivers' -and -not $SkipDrivers) {
-        Invoke-Step 'Delete SDIO and SDI downloads after finishing drivers' { Remove-DriverToolFiles }
-    }
     $reportName = if ($Worker -eq 'Coordinator') { 'report.csv' } else { 'report-' + $Worker + '.csv' }
     $script:Results | Export-Csv -Path (Join-Path $runDir $reportName) -NoTypeInformation -Encoding UTF8
     $script:Results | Format-Table -AutoSize
@@ -1056,6 +1078,23 @@ namespace FreshWindowsSetup {
     }
 }
 Read-Host 'This terminal finished. Press Enter to close it' | Out-Null
+if ($Worker -eq 'Drivers' -and -not $SkipDrivers) {
+    Invoke-Step 'Delete SDIO and SDI downloads on driver terminal exit' { Remove-DriverToolFiles }
+}
+if ($Worker -eq 'Coordinator') {
+    foreach ($job in $script:Workers) {
+        $job.Process.Refresh()
+        if (-not $job.Process.HasExited) {
+            Write-Host "Waiting for the $($job.Kind) terminal to close. Review it and press Enter there."
+            $job.Process.WaitForExit()
+        }
+        $job.Process.Refresh()
+        if ($job.Process.ExitCode -ne 0) {
+            Write-Warning "$($job.Kind) terminal exited with code $($job.Process.ExitCode)."
+            $script:Results.Add([pscustomobject]@{Step="$($job.Kind) terminal exit";Status='Needs attention';Detail="Exit code $($job.Process.ExitCode); this includes cleanup failures."})
+        }
+    }
+}
 if ($Worker -eq 'Coordinator' -and $CleanSetupFiles) {
     try {
         $expectedParent = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'FreshWindowsSetup'))
