@@ -284,56 +284,139 @@ function Invoke-DriverRescan {
     if ($LASTEXITCODE -ne 0) { Write-Warning "Device rescan returned $LASTEXITCODE." }
 }
 
-function Invoke-AutomaticWindowsDrivers {
-    Show-DriverProblems
-    Write-Host 'Automatic hardware-ID driver search WITHOUT SDI: scanning devices, querying Windows Update, downloading and installing matches.'
-    Invoke-DriverRescan
-    $session = New-Object -ComObject Microsoft.Update.Session
-    $session.ClientApplicationID = 'Fresh Windows Setup Drivers'
-    $searcher = $session.CreateUpdateSearcher()
-    $searcher.Online = $true
-    $search = $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Driver'")
-    if ([int]$search.ResultCode -ne 2) { throw "Driver search failed or was incomplete (result $($search.ResultCode))." }
-    $downloads = New-Object -ComObject Microsoft.Update.UpdateColl
-    for ($i = 0; $i -lt $search.Updates.Count; $i++) {
-        $update = $search.Updates.Item($i)
-        if ($update.InstallationBehavior.CanRequestUserInput) { Write-Warning "Interactive driver skipped: $($update.Title)"; continue }
-        if (-not $update.EulaAccepted) { $update.AcceptEula() }
-        Write-Host "Driver: $($update.Title)"
-        Write-Host "Matching hardware/compatible ID: $($update.DriverHardwareID)"
-        [void]$downloads.Add($update)
-    }
-    if (-not $downloads.Count) { Write-Host 'Windows Update offered no unattended driver packages.'; Show-DriverProblems; return }
-    $downloader = $session.CreateUpdateDownloader()
-    $downloader.Updates = $downloads
-    $downloader.Priority = 3
-    $downloadResult = $downloader.Download()
-    $installs = New-Object -ComObject Microsoft.Update.UpdateColl
-    for ($i = 0; $i -lt $downloads.Count; $i++) {
-        $update = $downloads.Item($i)
-        if ($update.IsDownloaded) { [void]$installs.Add($update) }
-        else { Write-Warning "Driver download failed: $($update.Title)" }
-    }
-    $downloadFailures = $downloads.Count - $installs.Count
-    if (-not $installs.Count) { throw 'No Windows Update driver packages downloaded successfully.' }
-    Invoke-DriverExclusive {
-        $installer = $session.CreateUpdateInstaller()
-        if ($installer.IsBusy) { throw 'Windows Update is busy installing something else. Retry option 3 when it finishes.' }
-        $installer.Updates = $installs
-        $installer.ForceQuiet = $true
-        $installer.AllowSourcePrompts = $false
-        $result = $installer.Install()
-        for ($i = 0; $i -lt $installs.Count; $i++) {
-            $itemResult = $result.GetUpdateResult($i)
-            Write-Host "$($installs.Item($i).Title): result $($itemResult.ResultCode), HRESULT $($itemResult.HResult)"
+function Test-OfficialDriverUrl {
+    param([string]$Url)
+    try {
+        $uri = [uri]$Url
+        if ($uri.Scheme -ne 'https' -or $uri.UserInfo) { return $false }
+        foreach ($domain in @('dell.com','hp.com','lenovo.com','asus.com','acer.com','msi.com',
+            'gigabyte.com','asrock.com','intel.com','amd.com','nvidia.com','realtek.com',
+            'realtek.com.tw','qualcomm.com','mediatek.com','microsoft.com','surface.com')) {
+            if ($uri.Host -eq $domain -or $uri.Host.EndsWith('.' + $domain)) { return $true }
         }
-        if ($result.RebootRequired) { Write-Warning 'Driver installation requires a restart after all setup terminals finish.' }
-        if ([int]$result.ResultCode -ne 2) { throw "Some driver installations failed (result $($result.ResultCode))." }
+    } catch { }
+    return $false
+}
+
+function Test-InfHardwareMatch {
+    param([string]$Text,[string[]]$Ids)
+    foreach ($line in ($Text -split '\r?\n')) {
+        $record = ($line -split ';',2)[0]
+        if ($record -notmatch '=') { continue }
+        # Match a complete model hardware/compatible-ID field, never a substring/comment.
+        $fields = (($record -split '=',2)[1] -split ',') | Select-Object -Skip 1
+        foreach ($field in $fields) {
+            if ($Ids -contains $field.Trim().Trim('"')) { return $true }
+        }
     }
-    if ($downloadFailures) { throw "$downloadFailures driver downloads failed; retry option 3." }
-    Invoke-DriverRescan
-    Write-Host 'Applicable unattended Windows Update drivers installed. No automatic reboot requested.'
+    return $false
+}
+
+function Invoke-AutomaticWebDrivers {
     Show-DriverProblems
+    Invoke-DriverRescan
+    Write-Host 'Searching the internet by hardware ID. No SDI and no Windows Update API.'
+    Write-Host 'Supported automatic packages: manufacturer-hosted ZIP/CAB archives with matching signed INF drivers. Unsupported/blocked downloads remain unresolved.'
+    $computer = Get-CimInstance Win32_ComputerSystem
+    $context = "$($computer.Manufacturer) $($computer.Model)"
+    $cache = Join-Path $env:ProgramData 'FreshWindowsSetup\DriverTools\HardwareWeb'
+    foreach ($part in @((Join-Path $env:ProgramData 'FreshWindowsSetup'),
+        (Join-Path $env:ProgramData 'FreshWindowsSetup\DriverTools'),$cache)) {
+        if (-not (Test-Path -LiteralPath $part)) { New-Item -ItemType Directory -Path $part | Out-Null }
+        if ((Get-Item -LiteralPath $part -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Hardware search cache cannot be a link.' }
+    }
+    if (-not $script:WebDriverSeen) { $script:WebDriverSeen = @{} }
+    $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
+        Where-Object { $_.ConfigManagerErrorCode -ne 22 })
+    foreach ($device in $devices) {
+        $ids = @($device.HardwareID | Where-Object { $_ })
+        if (-not $ids.Count) { Write-Warning "No hardware ID: $($device.Name)"; continue }
+        Write-Host "`nSearching: $($device.Name) | $($ids[0]) | error $($device.ConfigManagerErrorCode)"
+        foreach ($id in @($ids | Select-Object -First 2)) {
+            try {
+                $query = ($id -replace '[\\&_]',' ') + ' driver Windows 11 ' + $context
+                $searchUrl = 'https://html.duckduckgo.com/html/?q=' + [uri]::EscapeDataString($query)
+                Write-Host "Web query: $query"
+                $searchResponse = Invoke-WebRequest -UseBasicParsing -Uri $searchUrl -TimeoutSec 30
+                if ($searchResponse.Content -match 'challenge-form|anomaly-modal') { throw 'Search engine requested a CAPTCHA; no unattended search is available for this request.' }
+                $pages = @([regex]::Matches($searchResponse.Content, '(?i)uddg=([^&"<>]+)') |
+                    ForEach-Object { [uri]::UnescapeDataString($_.Groups[1].Value) } |
+                    Where-Object { Test-OfficialDriverUrl $_ } | Select-Object -Unique -First 4)
+                if (-not $pages.Count) { Write-Warning "No supported manufacturer search results for $id." }
+                foreach ($page in $pages) {
+                    Write-Host "Manufacturer result: $page"
+                    $urls = @()
+                    if (([uri]$page).AbsolutePath -match '\.(zip|cab)$') { $urls = @($page) }
+                    else {
+                        $response = Invoke-WebRequest -UseBasicParsing -Uri $page -TimeoutSec 30
+                        $finalPage = $response.BaseResponse.ResponseUri.AbsoluteUri
+                        if (-not (Test-OfficialDriverUrl $finalPage)) { throw 'Manufacturer page redirected outside supported sources.' }
+                        $urls = @([regex]::Matches($response.Content, '(?i)href\s*=\s*["'']([^"'']+)["'']') |
+                            ForEach-Object {
+                                try { ([uri]::new([uri]$finalPage,[Net.WebUtility]::HtmlDecode($_.Groups[1].Value))).AbsoluteUri } catch { }
+                            } | Where-Object { (Test-OfficialDriverUrl $_) -and ([uri]$_).AbsolutePath -match '\.(zip|cab)$' } |
+                            Select-Object -Unique -First 3)
+                    }
+                    foreach ($url in $urls) {
+                        try {
+                            $sha = [Security.Cryptography.SHA256]::Create()
+                            try { $key = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($url)))).Replace('-','').ToLowerInvariant() }
+                            finally { $sha.Dispose() }
+                            $extension = [IO.Path]::GetExtension(([uri]$url).AbsolutePath)
+                            $archive = Join-Path $cache ($key + $extension)
+                            $folder = Join-Path $cache $key
+                            if (-not $script:WebDriverSeen.ContainsKey($url)) {
+                                Write-Host "Downloading candidate: $url"
+                                $download = Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive -PassThru -TimeoutSec 120
+                                if (-not (Test-OfficialDriverUrl $download.BaseResponse.ResponseUri.AbsoluteUri)) { throw 'Package redirected outside supported manufacturer sources.' }
+                                Write-Host "Candidate SHA256: $((Get-FileHash -LiteralPath $archive).Hash)"
+                                New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                                if ($extension -eq '.zip') {
+                                    Add-Type -AssemblyName System.IO.Compression.FileSystem
+                                    $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+                                    try {
+                                        foreach ($entry in $zip.Entries) {
+                                            $target = [IO.Path]::GetFullPath((Join-Path $folder $entry.FullName))
+                                            if (-not $target.StartsWith($folder + '\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe archive entry.' }
+                                        }
+                                    } finally { $zip.Dispose() }
+                                    Expand-Archive -LiteralPath $archive -DestinationPath $folder -Force
+                                } else {
+                                    & "$env:SystemRoot\System32\expand.exe" '-F:*' $archive $folder | Out-Host
+                                    if ($LASTEXITCODE -ne 0) { throw 'CAB extraction failed.' }
+                                }
+                                $script:WebDriverSeen[$url] = $folder
+                            } else { $folder = $script:WebDriverSeen[$url]; Write-Host 'Reusing candidate already downloaded in this run.' }
+                            if (@(Get-ChildItem -LiteralPath $folder -Recurse -Force |
+                                Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) { throw 'Candidate contains linked files.' }
+                            foreach ($inf in @(Get-ChildItem -LiteralPath $folder -Filter '*.inf' -Recurse -File)) {
+                                $text = Get-Content -LiteralPath $inf.FullName -Raw
+                                if (-not (Test-InfHardwareMatch $text $ids)) { continue }
+                                $catalogs = @([regex]::Matches($text, '(?im)^\s*CatalogFile(?:\.[^=\s]+)?\s*=\s*([^;\r\n]+)') |
+                                    ForEach-Object { $_.Groups[1].Value.Trim().Trim('"') })
+                                $valid = $false
+                                foreach ($name in $catalogs) {
+                                    if ([IO.Path]::GetFileName($name) -ne $name) { continue }
+                                    $catalog = Join-Path $inf.DirectoryName $name
+                                    if ((Test-Path -LiteralPath $catalog) -and (Get-AuthenticodeSignature -LiteralPath $catalog).Status -eq 'Valid') { $valid = $true }
+                                }
+                                if (-not $valid) { Write-Warning "Matching INF has no verified catalog: $($inf.Name)"; continue }
+                                Write-Host "Matching signed driver candidate: $($inf.FullName)"
+                                Invoke-DriverExclusive {
+                                    & "$env:SystemRoot\System32\pnputil.exe" /add-driver $inf.FullName /install | Out-Host
+                                    if ($LASTEXITCODE -notin @(0,3010)) { throw "PnPUtil rejected candidate ($LASTEXITCODE)." }
+                                    if ($LASTEXITCODE -eq 3010) { Write-Warning 'Driver requires a restart after setup.' }
+                                }
+                            }
+                        } catch { Write-Warning "Candidate failed: $($_.Exception.Message)" }
+                    }
+                }
+            } catch { Write-Warning "Internet search failed for $id : $($_.Exception.Message)" }
+        }
+    }
+    Invoke-DriverRescan
+    Show-DriverProblems
+    Write-Host 'Internet search finished. Search results/package staging do not prove a device was fixed; the device list above is the current result.'
 }
 
 function Show-DriverProblems {
@@ -626,11 +709,11 @@ function Invoke-DriverWorkflow {
     Write-Host '3) Automatic hardware-ID driver search/download/install WITHOUT SDI'
     Write-Host '4) Original SDI graphical interface'
     do { $method = Read-Host 'Choose 1, 2, 3 or 4' } until ($method -in @('1','2','3','4'))
-    $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDIO' }; '3' { 'Windows Update' }; '4' { 'SDI' } }
+    $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDIO' }; '3' { 'Internet hardware-ID search' }; '4' { 'SDI' } }
     $automatic = $method -eq '1'
     do {
         try {
-            if ($tool -eq 'Windows Update') { Invoke-AutomaticWindowsDrivers } else {
+            if ($tool -eq 'Internet hardware-ID search') { Invoke-AutomaticWebDrivers } else {
             $exe = Get-DriverTool $tool
             if ($tool -eq 'SDIO' -and $automatic) {
                 if (-not $script:SdioIndexesReady) {
@@ -652,7 +735,7 @@ function Invoke-DriverWorkflow {
             }
             }
         } catch { Write-Warning "$tool : $($_.Exception.Message)" }
-        if ($tool -eq 'Windows Update') { Show-DriverProblems }
+        if ($tool -eq 'Internet hardware-ID search') { Show-DriverProblems }
         Write-Host "`n$tool has finished or closed. Are all drivers installed correctly?"
         Write-Host "1) Reopen the same tool ($tool) to check or retry."
         Write-Host '2) Switch between SDIO and original SDI.'
@@ -663,7 +746,7 @@ function Invoke-DriverWorkflow {
         do { $choice = Read-Host 'Choose 1, 2, 3, 4, 5 or 6' } until ($choice -in @('1','2','3','4','5','6'))
         if ($choice -eq '2') { $tool = if ($tool -eq 'SDIO') { 'SDI' } else { 'SDIO' }; $automatic = $false }
         if ($choice -eq '6') { $tool = 'SDIO'; $automatic = -not $automatic }
-        if ($choice -eq '3') { $tool = 'Windows Update' }
+        if ($choice -eq '3') { $tool = 'Internet hardware-ID search' }
         if ($choice -eq '5') { throw 'User reports incomplete driver installation. Re-run the driver workflow when ready.' }
     } while ($choice -notin @('4','5'))
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
@@ -1114,6 +1197,18 @@ namespace FreshWindowsSetup {
             if (-not $ready) { throw 'Office x64 pt-PT installation could not be verified within 60 minutes. Check the Microsoft installer.' }
             Write-Host 'Office product, architecture, language and Word executable detected. Office activation is separate.'
         }
+        if (-not $SkipFinalCommand) {
+            Read-Host 'Close the Office installer/update window, then press Enter to run the requested activation command' | Out-Null
+            Invoke-Step 'Requested command after Office setup closes' {
+                Write-Host 'Opening the requested command in a separate elevated PowerShell window. Complete its menu and close that window to continue.'
+                $commandProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                    -ArgumentList '-NoProfile -ExecutionPolicy Bypass -NoExit -Command "irm https://get.activated.win | iex"' -PassThru
+                $commandProcess.WaitForExit()
+                $commandProcess.Refresh()
+                if ($commandProcess.ExitCode -ne 0) { throw "Requested command window returned $($commandProcess.ExitCode). Review its displayed error." }
+                Write-Host 'Requested command window closed. This records process completion, not successful activation.'
+            }
+        }
     }
     if ($Worker -eq 'Coordinator') {
         foreach ($job in $script:Workers) {
@@ -1149,16 +1244,6 @@ namespace FreshWindowsSetup {
             # Terminate only this user's Explorer shell in the current session.
             Get-Process explorer -ErrorAction SilentlyContinue | Where-Object SessionId -eq $sessionId | Stop-Process -Force
             Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ArgumentList 'shell:MyComputerFolder'
-        }
-        if (-not $SkipFinalCommand) {
-            # Keep remote execution in a child PowerShell: its exit cannot close the setup/report process.
-            Invoke-Step 'Launch final requested command' {
-                Write-Host 'Running the requested final command now. Complete its menu and close it to return to setup.'
-                & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass `
-                    -Command 'irm https://get.activated.win | iex'
-                if ($LASTEXITCODE -ne 0) { throw "Final command process returned $LASTEXITCODE." }
-                Write-Host 'The requested final command returned. This confirms launch/return, not activation status.'
-            }
         }
     }
 } catch {
