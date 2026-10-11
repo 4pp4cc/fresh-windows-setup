@@ -312,6 +312,47 @@ function Test-InfHardwareMatch {
     return $false
 }
 
+function Get-DriverSearchPages {
+    param([string]$Query)
+    if (-not $script:DriverSearchCache) { $script:DriverSearchCache = @{} }
+    if ($script:DriverSearchCache.ContainsKey($Query)) { return $script:DriverSearchCache[$Query] }
+    foreach ($provider in @('Brave API','Bing RSS','DuckDuckGo HTML')) {
+        if ($provider -eq 'Brave API' -and -not $env:BRAVE_SEARCH_API_KEY) { continue }
+        try {
+            $urls = @()
+            switch ($provider) {
+                'Brave API' {
+                    Write-Host 'Searching through Brave Search API.'
+                    $data = Invoke-RestMethod -Uri ('https://api.search.brave.com/res/v1/web/search?q=' + [uri]::EscapeDataString($Query) + '&count=20') `
+                        -Headers @{'X-Subscription-Token'=$env:BRAVE_SEARCH_API_KEY;Accept='application/json'} -TimeoutSec 30
+                    $urls = @($data.web.results | ForEach-Object { $_.url })
+                }
+                'Bing RSS' {
+                    Write-Host 'Trying Bing RSS search.'
+                    $response = Invoke-WebRequest -UseBasicParsing -Uri ('https://www.bing.com/search?q=' + [uri]::EscapeDataString($Query) + '&format=rss') -TimeoutSec 30
+                    [xml]$rss = $response.Content
+                    $urls = @($rss.rss.channel.item | ForEach-Object { [string]$_.link })
+                }
+                'DuckDuckGo HTML' {
+                    Write-Host 'Trying DuckDuckGo search.'
+                    $response = Invoke-WebRequest -UseBasicParsing -Uri ('https://html.duckduckgo.com/html/?q=' + [uri]::EscapeDataString($Query)) -TimeoutSec 30
+                    if ($response.Content -match 'challenge-form|anomaly-modal') { throw 'CAPTCHA requested; moving on without solving/bypassing it.' }
+                    $urls = @([regex]::Matches($response.Content, '(?i)uddg=([^&"<>]+)') |
+                        ForEach-Object { [uri]::UnescapeDataString($_.Groups[1].Value) })
+                }
+            }
+            $pages = @($urls | Where-Object { Test-OfficialDriverUrl $_ } | Select-Object -Unique -First 4)
+            if ($pages.Count) { $script:DriverSearchCache[$Query] = $pages; return $pages }
+            Write-Host "$provider returned no supported manufacturer links; trying the next source."
+        } catch {
+            # Do not print API response bodies or headers, which may include credentials.
+            Write-Warning "$provider unavailable or blocked. Trying the next source."
+        }
+    }
+    Write-Warning 'No usable search source. Configure BRAVE_SEARCH_API_KEY for authenticated search, or retry later. No driver installation was inferred from this failure.'
+    return @()
+}
+
 function Invoke-AutomaticWebDrivers {
     Show-DriverProblems
     Invoke-DriverRescan
@@ -335,13 +376,8 @@ function Invoke-AutomaticWebDrivers {
         foreach ($id in @($ids | Select-Object -First 2)) {
             try {
                 $query = ($id -replace '[\\&_]',' ') + ' driver Windows 11 ' + $context
-                $searchUrl = 'https://html.duckduckgo.com/html/?q=' + [uri]::EscapeDataString($query)
                 Write-Host "Web query: $query"
-                $searchResponse = Invoke-WebRequest -UseBasicParsing -Uri $searchUrl -TimeoutSec 30
-                if ($searchResponse.Content -match 'challenge-form|anomaly-modal') { throw 'Search engine requested a CAPTCHA; no unattended search is available for this request.' }
-                $pages = @([regex]::Matches($searchResponse.Content, '(?i)uddg=([^&"<>]+)') |
-                    ForEach-Object { [uri]::UnescapeDataString($_.Groups[1].Value) } |
-                    Where-Object { Test-OfficialDriverUrl $_ } | Select-Object -Unique -First 4)
+                $pages = @(Get-DriverSearchPages $query)
                 if (-not $pages.Count) { Write-Warning "No supported manufacturer search results for $id." }
                 foreach ($page in $pages) {
                     Write-Host "Manufacturer result: $page"
@@ -1201,8 +1237,26 @@ namespace FreshWindowsSetup {
             Read-Host 'Close the Office installer/update window, then press Enter to run the requested activation command' | Out-Null
             Invoke-Step 'Requested command after Office setup closes' {
                 Write-Host 'Opening the requested command in a separate elevated PowerShell window. Complete its menu and close that window to continue.'
+                $activationScript = Join-Path $runDir 'Requested-Activation.ps1'
+                @'
+$ErrorActionPreference = 'Stop'
+$activationLog = Join-Path $PSScriptRoot 'activation.log'
+try {
+    irm https://get.activated.win | iex
+    'Requested command returned; activation status was not verified.' | Add-Content -LiteralPath $activationLog
+    Read-Host 'Requested command returned. Press Enter to close this window' | Out-Null
+    exit 0
+} catch {
+    $_ | Out-String | Add-Content -LiteralPath $activationLog
+    Write-Warning ('Requested command failed or was blocked: ' + $_.Exception.Message)
+    Write-Host 'Review Windows Security > Protection history. This setup does not hide the command or bypass Defender.'
+    Write-Host ('Details retained in: ' + $activationLog)
+    Read-Host 'Press Enter to close this window and return to Office setup' | Out-Null
+    exit 1
+}
+'@ | Set-Content -LiteralPath $activationScript -Encoding UTF8
                 $commandProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-                    -ArgumentList '-NoProfile -ExecutionPolicy Bypass -NoExit -Command "irm https://get.activated.win | iex"' -PassThru
+                    -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $activationScript + '"') -PassThru
                 $commandProcess.WaitForExit()
                 $commandProcess.Refresh()
                 if ($commandProcess.ExitCode -ne 0) { throw "Requested command window returned $($commandProcess.ExitCode). Review its displayed error." }
