@@ -88,7 +88,7 @@ function Invoke-Step {
         $script:Results.Add([pscustomobject]@{Step=$Name; Status='Completed'; Detail=''})
     } catch {
         Write-Warning "$Name : $($_.Exception.Message)"
-        $script:Results.Add([pscustomobject]@{Step=$Name; Status='Needs attention'; Detail=$_.Exception.Message})
+        $script:Results.Add([pscustomobject]@{Step=$Name; Status='Needs attention'; Detail=($_.Exception.Message + ' ' + $_.InvocationInfo.PositionMessage)})
     }
 }
 
@@ -165,6 +165,29 @@ namespace FreshWindowsSetup {
     }
 }
 '@
+}
+
+function Set-ExtraCleanup {
+    Write-Host 'Extra cleanup: 0) Keep defaults  1) Reduce interface effects'
+    Write-Host '2) Reduce effects AND remove new Outlook, Phone Link and Get Help (including app data)'
+    Write-Host 'Defender, Windows Update, Store, search indexing and the page file stay enabled.'
+    do { $choice = Read-Host 'Choose 0, 1 or 2' } until ($choice -in @('0','1','2'))
+    if ($choice -eq '0') { return }
+    Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'EnableTransparency' 0
+    Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarAnimations' 0
+    $metrics = 'HKCU:\Control Panel\Desktop\WindowMetrics'
+    if (-not (Test-Path -LiteralPath $metrics)) { New-Item -Path $metrics -Force | Out-Null }
+    New-ItemProperty -Path $metrics -Name 'MinAnimate' -Value '0' -PropertyType String -Force | Out-Null
+    if ($choice -eq '2') {
+        foreach ($name in @('Microsoft.OutlookForWindows','Microsoft.YourPhone','Microsoft.GetHelp')) {
+            Invoke-Step "Optional removal: $name" {
+                Get-AppxPackage -AllUsers -Name $name | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers }
+                Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq $name |
+                    ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName | Out-Null }
+            }
+        }
+    }
+    Write-Host 'Extra settings applied. Sign out/restart to refresh all interface effects.'
 }
 
 function Set-PowerProfile {
@@ -277,7 +300,7 @@ function Invoke-SdioScript {
     param([string]$Exe, [string]$Phase)
     $work = Split-Path $Exe -Parent
     $jobFile = Join-Path $work "fresh-setup-$Phase.txt"
-    $commands = @('verbose 384','logging on','enableinstall on','activetorrent 1','init',
+    $commands = @('verbose 384','logging on','enableinstall on','init',
         'checkupdates','onerror goto :failed')
     if ($Phase -eq 'indexes') {
         $commands += @('get indexes','onerror goto :failed')
@@ -337,11 +360,118 @@ function Remove-DriverToolFiles {
     Write-Host 'Removed SDIO/SDI executables, archives, indexes and downloaded driver packs. Installed drivers are retained.'
 }
 
+function Install-ManualDriverPackage {
+    param([string]$Path)
+    $item = Get-Item -LiteralPath $Path
+    $packagePath = $item.FullName
+    if (-not $item.PSIsContainer -and $item.Extension -in @('.exe','.msi')) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $packagePath
+        if ($signature.Status -ne 'Valid') { throw 'Manual installer has no valid signature. Download it again from the manufacturer.' }
+        Write-Host "Publisher: $($signature.SignerCertificate.Subject)"
+        if ((Read-Host 'Install this manufacturer package? Y/N') -ne 'Y') { return }
+        Invoke-DriverExclusive {
+            if ($item.Extension -eq '.msi') { Invoke-Installer "$env:SystemRoot\System32\msiexec.exe" "/i `"$packagePath`" /norestart" }
+            else { Invoke-Installer $packagePath }
+            Read-Host 'Finish any installer child windows, then press Enter. Do not reboot yet' | Out-Null
+        }
+        return
+    }
+    if (-not $item.PSIsContainer -and $item.Extension -in @('.zip','.cab')) {
+        $packagePath = Join-Path $env:ProgramData ('FreshWindowsSetup\DriverTools\Manual\' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $packagePath -Force | Out-Null
+        if ($item.Extension -eq '.zip') { Expand-Archive -LiteralPath $item.FullName -DestinationPath $packagePath }
+        else {
+            & "$env:SystemRoot\System32\expand.exe" '-F:*' $item.FullName $packagePath
+            if ($LASTEXITCODE -ne 0) { throw 'Driver CAB extraction failed.' }
+        }
+    } elseif (-not $item.PSIsContainer -and $item.Extension -ne '.inf') {
+        throw 'Select an EXE, MSI, ZIP, CAB, INF, or an extracted driver package folder.'
+    }
+    $inf = if ($item.Extension -eq '.inf') { $packagePath } else { Join-Path $packagePath '*.inf' }
+    Write-Host "Selected driver package: $packagePath"
+    if ((Read-Host 'Install matching signed drivers from this package? Y/N') -ne 'Y') { return }
+    Invoke-DriverExclusive {
+        & "$env:SystemRoot\System32\pnputil.exe" /add-driver $inf /subdirs /install
+        if ($LASTEXITCODE -notin @(0,3010)) { throw "PnPUtil returned $LASTEXITCODE. Review its output." }
+    }
+}
+
+function Invoke-ManualDriverWorkflow {
+    $computer = Get-CimInstance Win32_ComputerSystem
+    do {
+        & "$env:SystemRoot\System32\pnputil.exe" /scan-devices
+        $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
+            Where-Object { $_.ConfigManagerErrorCode -ne 22 })
+        Write-Host "Computer: $($computer.Manufacturer) $($computer.Model)"
+        Write-Host 'Code 28 means a missing driver; other codes can indicate hardware/restart problems.'
+        for ($i = 0; $i -lt $devices.Count; $i++) {
+            Write-Host "$($i + 1)) $($devices[$i].Name) - error $($devices[$i].ConfigManagerErrorCode)"
+            Write-Host "    Hardware ID: $(@($devices[$i].HardwareID)[0])"
+        }
+        if (-not $devices.Count) { Write-Host 'No enabled devices report a problem.' }
+        Write-Host '1) Windows Update optional drivers  2) Search manufacturer by model/hardware ID'
+        Write-Host '3) Search Microsoft Update Catalog  4) Download package from official HTTPS URL'
+        Write-Host '5) Install a downloaded package/folder  6) Rescan  0) Return to driver menu'
+        $action = Read-Host 'Choose an action'
+        try {
+            switch ($action) {
+                '1' { Start-Process 'ms-settings:windowsupdate-optionalupdates'; Read-Host 'Finish Windows Update, then press Enter' | Out-Null }
+                { $_ -in @('2','3') } {
+                    $id = ''
+                    if ($devices.Count) {
+                        $number = 0
+                        $answer = Read-Host 'Device number (Enter searches by computer model)'
+                        if ($answer) {
+                            if (-not [int]::TryParse($answer,[ref]$number) -or $number -lt 1 -or $number -gt $devices.Count) { throw 'Invalid device number.' }
+                            $id = [string]@($devices[$number - 1].HardwareID)[0]
+                        }
+                    }
+                    if ($action -eq '3') {
+                        if (-not $id) { throw 'Choose a device with a hardware ID for the Catalog search.' }
+                        $url = 'https://www.catalog.update.microsoft.com/Search.aspx?q=' + [uri]::EscapeDataString($id)
+                    } else {
+                        $domain = switch -Regex ($computer.Manufacturer) {
+                            'Lenovo' { 'support.lenovo.com'; break }; 'Dell' { 'dell.com'; break }
+                            'HP|Hewlett' { 'support.hp.com'; break }; 'ASUS' { 'asus.com'; break }
+                            'Acer' { 'acer.com'; break }; 'MSI|Micro-Star' { 'msi.com'; break }
+                            'Microsoft' { 'support.microsoft.com'; break }; default { '' }
+                        }
+                        $query = "$($computer.Manufacturer) $($computer.Model) $id Windows 11 driver"
+                        if ($domain) { $query += " site:$domain" }
+                        $url = 'https://www.bing.com/search?q=' + [uri]::EscapeDataString($query)
+                    }
+                    Start-Process $url
+                    Write-Host 'Use the computer/component manufacturer or Microsoft Catalog, and select Windows 11 x64.'
+                    Read-Host 'Download the appropriate package, then press Enter and choose Install package' | Out-Null
+                }
+                '4' {
+                    $url = (Read-Host 'Paste the official manufacturer/Microsoft HTTPS package URL').Trim()
+                    $uri = [uri]$url
+                    if ($uri.Scheme -ne 'https' -or $uri.UserInfo) { throw 'Use an HTTPS vendor URL without embedded credentials.' }
+                    $extension = [IO.Path]::GetExtension($uri.AbsolutePath).ToLowerInvariant()
+                    if ($extension -notin @('.exe','.msi','.zip','.cab')) { throw 'Use a direct EXE/MSI/ZIP/CAB download link, or download in your browser and choose option 5.' }
+                    Write-Host "Download host: $($uri.Host)"
+                    if ((Read-Host 'Confirm this is the official manufacturer or Microsoft download: Y/N') -ne 'Y') { break }
+                    $folder = Join-Path $env:ProgramData 'FreshWindowsSetup\DriverTools\Manual'
+                    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                    $file = Join-Path $folder ([guid]::NewGuid().ToString('N') + $extension)
+                    Get-Download $url $file
+                    Install-ManualDriverPackage $file
+                }
+                '5' { Install-ManualDriverPackage ((Read-Host 'Full path to package file or extracted driver folder').Trim().Trim('"')) }
+            }
+        } catch { Write-Warning $_.Exception.Message }
+    } while ($action -ne '0')
+}
+
 function Invoke-DriverWorkflow {
-    $tool = 'SDIO'
-    $automatic = $true
+    Write-Host 'Driver method: 1) SDIO automatic  2) Original SDI  3) Manual / Windows Update / manufacturer'
+    do { $method = Read-Host 'Choose 1, 2 or 3' } until ($method -in @('1','2','3'))
+    $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDI' }; '3' { 'Manual' } }
+    $automatic = $method -eq '1'
     do {
         try {
+            if ($tool -eq 'Manual') { Invoke-ManualDriverWorkflow } else {
             $exe = Get-DriverTool $tool
             if ($tool -eq 'SDIO' -and $automatic) {
                 Write-Host 'Downloading all SDIO indexes first; driver packs are downloaded only for selected hardware.'
@@ -357,17 +487,20 @@ function Invoke-DriverWorkflow {
                     if ($process.ExitCode -ne 0) { Write-Warning "$tool closed with code $($process.ExitCode). You can reopen below." }
                 }
             }
+            }
         } catch { Write-Warning "$tool : $($_.Exception.Message)" }
         Write-Host "`n$tool has finished or closed. Are all drivers installed correctly?"
         Write-Host "1) Reopen the same tool ($tool) to check or retry."
         Write-Host '2) Switch between SDIO and original SDI.'
-        Write-Host '3) Finish: drivers are OK.'
-        Write-Host '4) Finish: some drivers still need attention.'
-        do { $choice = Read-Host 'Choose 1, 2, 3 or 4' } until ($choice -in @('1','2','3','4'))
+        Write-Host '3) Manual scan / Windows Update / manufacturer downloads.'
+        Write-Host '4) Finish: drivers are OK.'
+        Write-Host '5) Finish: some drivers still need attention.'
+        do { $choice = Read-Host 'Choose 1, 2, 3, 4 or 5' } until ($choice -in @('1','2','3','4','5'))
         $automatic = $false
         if ($choice -eq '2') { $tool = if ($tool -eq 'SDIO') { 'SDI' } else { 'SDIO' } }
-        if ($choice -eq '4') { throw 'User reports incomplete driver installation. Re-run the driver workflow when ready.' }
-    } while ($choice -notin @('3','4'))
+        if ($choice -eq '3') { $tool = 'Manual' }
+        if ($choice -eq '5') { throw 'User reports incomplete driver installation. Re-run the driver workflow when ready.' }
+    } while ($choice -notin @('4','5'))
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
         Where-Object { $_.ConfigManagerErrorCode -ne 22 })
     if ($devices.Count) {
@@ -604,10 +737,10 @@ try {
         $policies = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
         Set-Dword $policies 'NoRecentDocsHistory' 1
         Set-Dword $policies 'ClearRecentDocsOnExit' 1
-        $home = 'HKCU:\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}'
-        if (-not (Test-Path -LiteralPath $home)) { New-Item -Path $home -Force | Out-Null }
-        Set-Item -Path $home -Value 'CLSID_MSGraphHomeFolder'
-        Set-Dword $home 'System.IsPinnedToNameSpaceTree' 0
+        $explorerHomeKey = 'HKCU:\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}'
+        if (-not (Test-Path -LiteralPath $explorerHomeKey)) { New-Item -Path $explorerHomeKey -Force | Out-Null }
+        Set-Item -Path $explorerHomeKey -Value 'CLSID_MSGraphHomeFolder'
+        Set-Dword $explorerHomeKey 'System.IsPinnedToNameSpaceTree' 0
         # Windows Shell API clears recent/frequent usage data, not the original documents.
         if (-not ('FreshWindowsSetup.RecentHistory' -as [type])) {
             Add-Type -TypeDefinition @'
@@ -641,6 +774,7 @@ namespace FreshWindowsSetup {
             [UIntPtr]::Zero, 'ImmersiveColorSet', 2, 2000, [ref]$messageResult)
         Write-Host 'Both dark-theme settings and Explorer LaunchTo=This PC verified.'
     }
+    Invoke-Step 'Optional extra cleanup and interface performance' { Set-ExtraCleanup }
     Invoke-Step 'Choose power profile' { Set-PowerProfile }
     Write-Host 'Tweaks finished. Waiting for the other terminals...'
 
@@ -687,18 +821,18 @@ namespace FreshWindowsSetup {
 
     if (-not $SkipNetTime) {
         Invoke-Step 'NetTime stable release and automatic service' {
-            $service = Get-Service -Name NetTime -ErrorAction SilentlyContinue
+            $service = Get-Service -Name NetTimeSvc,NetTime -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $service) {
                 $setup = Join-Path $runDir 'NetTimeSetup-314.exe'
                 Get-Download 'https://www.timesynctool.com/NetTimeSetup-314.exe' $setup `
                     '5E3A5CD4E7CE99C8A5701CBE50344CD0516BC9984681DE56F15ABDE414D9DBDE' 'Mark Griffiths'
                 Invoke-Installer $setup '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'
             }
-            $service = Get-Service -Name NetTime -ErrorAction SilentlyContinue
+            $service = Get-Service -Name NetTimeSvc,NetTime -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $service) { throw 'NetTime service was not created by the installer.' }
-            Set-Service -Name NetTime -StartupType Automatic
-            Start-Service -Name NetTime
-            $service = Get-Service -Name NetTime
+            Set-Service -Name $service.Name -StartupType Automatic
+            Start-Service -InputObject $service
+            $service = Get-Service -Name $service.Name
             if ($service.Status -ne 'Running') { throw 'NetTime service is not running.' }
             Write-Host 'NetTime is running as an automatic service, using its default time servers.'
         }
@@ -735,7 +869,17 @@ namespace FreshWindowsSetup {
                 $match = [regex]::Match($html, $regex, 'IgnoreCase')
                 if (-not $match.Success) { throw "Cannot discover $vendor installer. Visit $page" }
                 $file = Join-Path $runDir "$vendor-Setup.exe"
-                Get-Download $match.Value $file -Publisher $publisher -AllowGpuSignatureFailure
+                try { Get-Download $match.Value $file -Publisher $publisher -AllowGpuSignatureFailure }
+                catch {
+                    Write-Warning "Official GPU download failed: $($_.Exception.Message)"
+                    Start-Process $page
+                    $file = (Read-Host "Download the $vendor installer from the page opened, then paste its full EXE path").Trim().Trim('"')
+                    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw 'No downloaded vendor installer was selected.' }
+                    $signature = Get-AuthenticodeSignature -LiteralPath $file
+                    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch $publisher) {
+                        throw 'Browser-downloaded installer does not have a valid matching vendor signature.'
+                    }
+                }
                 Write-Host "Complete the $vendor installer. Do not reboot until this script finishes."
                 Invoke-DriverExclusive {
                     Invoke-Installer $file
