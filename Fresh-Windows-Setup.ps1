@@ -475,9 +475,18 @@ function Invoke-DriverExclusive {
     $mutex = New-Object Threading.Mutex($false, 'Local\FreshWindowsSetupDriverInstall')
     $locked = $false
     try {
-        Write-Host 'Waiting for any other GPU/driver installation to finish...'
-        try { $locked = $mutex.WaitOne() }
+        try { $locked = $mutex.WaitOne(0) }
         catch [Threading.AbandonedMutexException] { $locked = $true }
+        while (-not $locked) {
+            Write-Host 'Another setup terminal owns the driver installation lock. This installer has not started.'
+            Write-Host '1) Wait another 15 seconds'
+            Write-Host '2) Return to the retry/menu options without starting this installation'
+            do { $waitChoice = Read-Host 'Choose 1 or 2' } until ($waitChoice -in @('1','2'))
+            if ($waitChoice -eq '2') { throw 'Driver installation deferred: another terminal is busy. Retry after its installer finishes/closes.' }
+            try { $locked = $mutex.WaitOne(15000) }
+            catch [Threading.AbandonedMutexException] { $locked = $true }
+        }
+        Write-Host 'Driver installation lock acquired; starting this operation.'
         & $Action
     } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
 }
@@ -1038,10 +1047,11 @@ namespace FreshWindowsSetup {
                 try {
                 Invoke-DriverExclusive {
                     Invoke-Installer $file $silentArguments
-                    $deadline = (Get-Date).AddMinutes(20)
-                    while (-not (Test-Path -LiteralPath $appPath) -and (Get-Date) -lt $deadline) {
-                        Start-Sleep -Seconds 5
-                    }
+                }
+                Write-Host 'Installer process finished. Checking for the vendor app for up to 2 minutes; the driver lock is released.'
+                $deadline = (Get-Date).AddMinutes(2)
+                while (-not (Test-Path -LiteralPath $appPath) -and (Get-Date) -lt $deadline) {
+                    Start-Sleep -Seconds 5
                 }
                 } catch { $silentFailed = $true; Write-Warning "Silent installer failed: $($_.Exception.Message)" }
                 if ($silentFailed -or -not (Test-Path -LiteralPath $appPath)) {
@@ -1053,7 +1063,7 @@ namespace FreshWindowsSetup {
                     if ($retry -eq '3') { throw "$vendor app not detected after silent setup." }
                     Invoke-DriverExclusive {
                         if ($retry -eq '1') { Invoke-Installer $file $silentArguments }
-                        else { Invoke-Installer $file; Read-Host 'Finish installer windows, then press Enter' | Out-Null }
+                        else { Invoke-Installer $file }
                     }
                     if (-not (Test-Path -LiteralPath $appPath)) { throw "$vendor app still not detected. Review vendor installation errors." }
                 }
