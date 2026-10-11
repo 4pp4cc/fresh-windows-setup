@@ -22,6 +22,8 @@ guarantee or warranty. GPU signature checks may be bypassed for official
 vendor downloads as requested. Performance settings increase battery use.
 Installed uBlock extensions are left alone; setup no longer installs them.
 SDIO/SDI downloads are retained through retries and deleted on driver terminal exit.
+Debug .log files are retained under ProgramData\FreshWindowsSetup\Logs.
+Structured last-run state is retained under ProgramData\FreshWindowsSetup\State.
 #>
 [CmdletBinding()]
 param(
@@ -167,6 +169,42 @@ namespace FreshWindowsSetup {
 '@
 }
 
+function Save-SetupLogs {
+    param([string]$SourceRoot,[ValidateSet('Drivers','Setup')][string]$Label)
+    $root = (Resolve-Path -LiteralPath $SourceRoot).ProviderPath.TrimEnd('\')
+    $base = Join-Path $env:ProgramData 'FreshWindowsSetup'
+    $logRoot = Join-Path $base ('Logs\' + (Split-Path $runDir -Leaf) + '\' + $Label)
+    foreach ($folder in @($base,(Join-Path $base 'Logs'),(Split-Path $logRoot -Parent),$logRoot)) {
+        if (Test-Path -LiteralPath $folder) {
+            if ((Get-Item -LiteralPath $folder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Log preservation refuses linked folders.' }
+        } else { New-Item -ItemType Directory -Path $folder | Out-Null }
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter '*.log' -File -Recurse -Force)) {
+        if (-not $file.FullName.StartsWith($root + '\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected log source path.' }
+        $relative = $file.FullName.Substring($root.Length + 1)
+        $destination = Join-Path $logRoot $relative
+        $parent = Split-Path $destination -Parent
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+    }
+    Write-Host "Debug logs retained: $logRoot"
+}
+
+function Save-SetupState {
+    $base = Join-Path $env:ProgramData 'FreshWindowsSetup'
+    $stateFolder = Join-Path $base 'State'
+    if (Test-Path -LiteralPath $stateFolder) {
+        if ((Get-Item -LiteralPath $stateFolder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'State folder cannot be a link.' }
+    } else { New-Item -ItemType Directory -Path $stateFolder | Out-Null }
+    $remaining = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
+        Where-Object { $_.ConfigManagerErrorCode -ne 22 } | Select-Object Name,ConfigManagerErrorCode,HardwareID)
+    $state = [pscustomobject]@{LastRun=(Get-Date).ToString('o');Results=@($script:Results.ToArray());UnresolvedDevices=$remaining}
+    $path = Join-Path $stateFolder 'last-run.json'
+    $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath ($path + '.tmp') -Encoding UTF8
+    Move-Item -LiteralPath ($path + '.tmp') -Destination $path -Force
+    Write-Host "Last-run state retained: $path"
+}
+
 function Get-GpuInstaller {
     param([string]$Vendor,[string]$Page,[string]$Pattern,[string]$Publisher)
     $file = Join-Path $runDir "$Vendor-Setup.exe"
@@ -248,7 +286,7 @@ function Invoke-DriverRescan {
 
 function Invoke-AutomaticWindowsDrivers {
     Show-DriverProblems
-    Write-Host 'Scanning installed hardware and searching Windows Update for applicable drivers...'
+    Write-Host 'Automatic hardware-ID driver search WITHOUT SDI: scanning devices, querying Windows Update, downloading and installing matches.'
     Invoke-DriverRescan
     $session = New-Object -ComObject Microsoft.Update.Session
     $session.ClientApplicationID = 'Fresh Windows Setup Drivers'
@@ -262,6 +300,7 @@ function Invoke-AutomaticWindowsDrivers {
         if ($update.InstallationBehavior.CanRequestUserInput) { Write-Warning "Interactive driver skipped: $($update.Title)"; continue }
         if (-not $update.EulaAccepted) { $update.AcceptEula() }
         Write-Host "Driver: $($update.Title)"
+        Write-Host "Matching hardware/compatible ID: $($update.DriverHardwareID)"
         [void]$downloads.Add($update)
     }
     if (-not $downloads.Count) { Write-Host 'Windows Update offered no unattended driver packages.'; Show-DriverProblems; return }
@@ -513,6 +552,7 @@ function Remove-DriverToolFiles {
         $_.ExecutablePath -and $_.ExecutablePath.StartsWith($cacheRoot + '\', [StringComparison]::OrdinalIgnoreCase)
     })
     if ($running.Count) { throw 'SDIO/SDI is still open. Close it before deleting its cache.' }
+    Save-SetupLogs -SourceRoot $resolved -Label 'Drivers'
     Remove-Item -LiteralPath $resolved -Recurse -Force
     if (Test-Path -LiteralPath $cacheRoot) { throw 'SDIO/SDI cache remains; review the cleanup error.' }
     Write-Host 'Removed SDIO/SDI executables, archives, indexes and downloaded driver packs. Installed drivers are retained.'
@@ -523,7 +563,7 @@ function Invoke-DriverWorkflow {
     Write-Host "`nDriver method:"
     Write-Host '1) SDIO automatic terminal'
     Write-Host '2) SDIO graphical interface'
-    Write-Host '3) Automatic Windows Update hardware-matched drivers'
+    Write-Host '3) Automatic hardware-ID driver search/download/install WITHOUT SDI'
     Write-Host '4) Original SDI graphical interface'
     do { $method = Read-Host 'Choose 1, 2, 3 or 4' } until ($method -in @('1','2','3','4'))
     $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDIO' }; '3' { 'Windows Update' }; '4' { 'SDI' } }
@@ -556,7 +596,7 @@ function Invoke-DriverWorkflow {
         Write-Host "`n$tool has finished or closed. Are all drivers installed correctly?"
         Write-Host "1) Reopen the same tool ($tool) to check or retry."
         Write-Host '2) Switch between SDIO and original SDI.'
-        Write-Host '3) Automatic Windows Update hardware-matched drivers.'
+        Write-Host '3) Automatic hardware-ID driver search/download/install WITHOUT SDI.'
         Write-Host '4) Finish: drivers are OK.'
         Write-Host '5) Finish: some drivers still need attention.'
         Write-Host '6) Switch SDIO between automatic terminal and graphical interface'
@@ -674,6 +714,15 @@ try {
     Write-Host 'Project: https://github.com/4pp4cc/fresh-windows-setup'
     Write-Host 'Support / Ko-Fi: https://ko-fi.com/gzred'
     Write-Host 'Credits: Raphire/Win11Debloat, Glenn Delahoy/SDIO, original SDI and software vendors.'
+    $previousState = Join-Path $env:ProgramData 'FreshWindowsSetup\State\last-run.json'
+    if (Test-Path -LiteralPath $previousState) {
+        try {
+            $previous = Get-Content -LiteralPath $previousState -Raw | ConvertFrom-Json
+            $previousFailures = @($previous.Results | Where-Object Status -eq 'Needs attention')
+            Write-Host "Previous run: $($previous.LastRun); $($previousFailures.Count) step(s) previously needed attention."
+            Write-Host 'Installed versions and current hardware are checked again before updating.'
+        } catch { Write-Warning 'Previous-run state is unreadable; continuing with fresh checks.' }
+    }
     Write-Warning 'AS IS, without guarantee or warranty. Keep a backup: a restore point is not a full backup.'
     Write-Warning 'Setup removes apps, changes settings, installs drivers and runs the requested final remote command.'
     Write-Warning 'Official GPU signature-check failures may be bypassed. Performance settings increase battery use.'
@@ -1058,6 +1107,7 @@ namespace FreshWindowsSetup {
     $script:Results | Export-Csv -Path (Join-Path $runDir $reportName) -NoTypeInformation -Encoding UTF8
     $script:Results | Format-Table -AutoSize
     Write-Host "`nLogs, backups and report: $runDir"
+    Write-Host "After exit, debug .log files remain under $env:ProgramData\FreshWindowsSetup\Logs."
     if ($Worker -eq 'Coordinator') {
         Write-Host 'Created by GZ / 4pp4cc - Support / Ko-Fi: https://ko-fi.com/gzred'
         $issues = @($script:Results | Where-Object Status -eq 'Needs attention')
@@ -1072,10 +1122,6 @@ namespace FreshWindowsSetup {
         Move-Item -LiteralPath $temporary -Destination $statusPath
     }
     Stop-Transcript | Out-Null
-    if ($Worker -eq 'Coordinator' -and $script:RunMutex) {
-        $script:RunMutex.ReleaseMutex()
-        $script:RunMutex.Dispose()
-    }
 }
 Read-Host 'This terminal finished. Press Enter to close it' | Out-Null
 if ($Worker -eq 'Drivers' -and -not $SkipDrivers) {
@@ -1094,6 +1140,9 @@ if ($Worker -eq 'Coordinator') {
             $script:Results.Add([pscustomobject]@{Step="$($job.Kind) terminal exit";Status='Needs attention';Detail="Exit code $($job.Process.ExitCode); this includes cleanup failures."})
         }
     }
+}
+if ($Worker -eq 'Coordinator') {
+    try { Save-SetupState } catch { Write-Warning "Could not save last-run state: $($_.Exception.Message)" }
 }
 if ($Worker -eq 'Coordinator' -and $CleanSetupFiles) {
     try {
@@ -1117,11 +1166,16 @@ if ($Worker -eq 'Coordinator' -and $CleanSetupFiles) {
                 if ($item.PSIsContainer) { $pending.Push($item.FullName) }
             }
         }
+        Save-SetupLogs -SourceRoot $target -Label 'Setup'
         Remove-Item -LiteralPath $target -Recurse -Force
     } catch {
         Write-Warning "Setup temporary-file cleanup failed: $($_.Exception.Message)"
         exit 1
     }
+}
+if ($Worker -eq 'Coordinator' -and $script:RunMutex) {
+    $script:RunMutex.ReleaseMutex()
+    $script:RunMutex.Dispose()
 }
 if (@($script:Results | Where-Object Status -eq 'Needs attention').Count -gt 0) { exit 1 }
 exit 0
