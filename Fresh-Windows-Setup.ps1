@@ -1217,7 +1217,9 @@ function Invoke-DriverWorkflow {
             }
             }
         } catch { Write-Warning "$tool : $($_.Exception.Message)" }
-        if ($tool -eq 'Internet hardware-ID search') { Show-DriverProblems }
+        Invoke-DriverRescan
+        Show-DriverProblems
+        Write-Host 'An installer success message does not confirm Bluetooth/Wi-Fi/audio actually works. Test the device before choosing Finish.'
         Write-Host "`n$tool has finished or closed. Are all drivers installed correctly?"
         Write-Host "1) Reopen the same tool ($tool) to check or retry."
         Write-Host '2) Switch between SDIO and original SDI.'
@@ -1225,10 +1227,17 @@ function Invoke-DriverWorkflow {
         Write-Host '4) Finish: drivers are OK.'
         Write-Host '5) Finish: some drivers still need attention.'
         Write-Host '6) Switch SDIO between automatic terminal and graphical interface'
-        do { $choice = Read-Host 'Choose 1, 2, 3, 4, 5 or 6' } until ($choice -in @('1','2','3','4','5','6'))
+        Write-Host '7) Installed but device does not work: choose an alternative driver (GUI, existing packs retained)'
+        do { $choice = Read-Host 'Choose 1, 2, 3, 4, 5, 6 or 7' } until ($choice -in @('1','2','3','4','5','6','7'))
         if ($choice -eq '2') { $tool = if ($tool -eq 'SDIO') { 'SDI' } else { 'SDIO' }; $automatic = $false }
         if ($choice -eq '6') { $tool = 'SDIO'; $automatic = -not $automatic }
         if ($choice -eq '3') { $tool = 'Internet hardware-ID search' }
+        if ($choice -eq '7') {
+            if ($tool -eq 'Internet hardware-ID search') { $tool = 'SDIO' }
+            $automatic = $false
+            Write-Host 'Expand the affected device using its double arrows and try the next matching candidate, then test the device.'
+            Write-Host 'Repeating terminal auto-install would select the preferred candidate again; this opens alternatives instead.'
+        }
         if ($choice -eq '5') { throw 'User reports incomplete driver installation. Re-run the driver workflow when ready.' }
     } while ($choice -notin @('4','5'))
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
