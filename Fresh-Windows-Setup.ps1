@@ -35,12 +35,25 @@ param(
     [switch]$SkipDrivers,
     [switch]$SkipFinalCommand,
     [switch]$CleanSetupFiles,
-    [ValidateSet('Coordinator','Apps','Office','Drivers')][string]$Worker = 'Coordinator',
+    [ValidateSet('All','Debloat','Software','Office','Drivers','Gpu')][string]$Part = 'All',
+    [ValidateRange(0,3)][int]$DebloatLevel = 0,
+    [ValidateSet('Coordinator','Apps','Office','Drivers','Manufacturer')][string]$Worker = 'Coordinator',
     [string]$RunRoot
 )
 
 $ErrorActionPreference = 'Stop'
 $script:SetupParameters = $PSBoundParameters
+if ($Worker -eq 'Coordinator' -and $Part -ne 'All') {
+    $SkipDebloat = $Part -ne 'Debloat'
+    $SkipApps = $Part -ne 'Software'
+    $SkipNetTime = $Part -ne 'Software'
+    $SkipOffice = $Part -ne 'Office'
+    $SkipDrivers = $Part -ne 'Drivers'
+    $SkipGpu = $Part -ne 'Gpu'
+}
+foreach ($flag in @('SkipDebloat','SkipApps','SkipNetTime','SkipOffice','SkipDrivers','SkipGpu','SkipFinalCommand')) {
+    $script:SetupParameters[$flag] = [bool](Get-Variable -Name $flag -ValueOnly)
+}
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
     throw 'Use Windows PowerShell 5.1 (powershell.exe), not PowerShell 7.'
 }
@@ -202,11 +215,46 @@ function Save-SetupState {
     } else { New-Item -ItemType Directory -Path $stateFolder | Out-Null }
     $remaining = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
         Where-Object { $_.ConfigManagerErrorCode -ne 22 } | Select-Object Name,ConfigManagerErrorCode,HardwareID)
-    $state = [pscustomobject]@{LastRun=(Get-Date).ToString('o');Results=@($script:Results.ToArray());UnresolvedDevices=$remaining}
     $path = Join-Path $stateFolder 'last-run.json'
+    $history = @{}
+    if ($Part -ne 'All' -and (Test-Path -LiteralPath $path)) {
+        try {
+            $previous = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            foreach ($entry in @($previous.RunHistory.PSObject.Properties)) { $history[$entry.Name] = $entry.Value }
+        } catch { Write-Warning 'Previous run history could not be merged; this run is still recorded.' }
+    }
+    $now = (Get-Date).ToString('o')
+    $history[$Part] = [pscustomobject]@{Time=$now;Results=@($script:Results.ToArray());UnresolvedDevices=$remaining}
+    $state = [pscustomobject]@{LastRun=$now;Part=$Part;DebloatLevel=$DebloatLevel;ContextMenu=$script:ContextMenuChoice;RunHistory=$history;Results=@($script:Results.ToArray());UnresolvedDevices=$remaining}
     $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath ($path + '.tmp') -Encoding UTF8
     Move-Item -LiteralPath ($path + '.tmp') -Destination $path -Force
     Write-Host "Last-run state retained: $path"
+}
+
+function Wait-FinalReviewPhase {
+    if ($Worker -eq 'Coordinator' -or $script:FinalReviewOpen) { return }
+    $ready = Join-Path $runDir ('ready-' + $Worker + '.txt')
+    Set-Content -LiteralPath $ready -Value 'Automatic work finished or requires final review'
+    $gate = Join-Path $runDir 'final-review.txt'
+    Write-Host 'Automatic phase paused for final review. Other terminals continue working; questions unlock after automatic cleanup.'
+    while (-not (Test-Path -LiteralPath $gate)) {
+        $ownerPath = Join-Path $runDir 'coordinator-process.txt'
+        if (Test-Path -LiteralPath $ownerPath) {
+            $ownerId = [int](Get-Content -LiteralPath $ownerPath -Raw)
+            if (-not (Get-Process -Id $ownerId -ErrorAction SilentlyContinue)) {
+                Write-Warning 'Coordinator exited. Opening this terminal for review.'
+                break
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+    $script:FinalReviewOpen = $true
+}
+
+function Read-Host {
+    param([string]$Prompt,[switch]$AsSecureString)
+    Wait-FinalReviewPhase
+    Microsoft.PowerShell.Utility\Read-Host @PSBoundParameters
 }
 
 function Get-GpuInstaller {
@@ -731,11 +779,7 @@ function Invoke-AutomaticWebDrivers {
         Where-Object { $_.ConfigManagerErrorCode -ne 22 })
     $inventory = @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 22 })
     $allIds = @($inventory | ForEach-Object { @($_.HardwareID) + @($_.CompatibleID) } | Where-Object { $_ } | Select-Object -Unique)
-    try { Invoke-OemDriverCatalog $computer $cache $allIds } catch {
-        if ($_.Exception.Message -like 'Driver installation deferred:*') { throw }
-        Write-Warning "Official catalog lookup failed: $($_.Exception.Message)"
-        if ($null -ne $script:Results) { $script:Results.Add([pscustomobject]@{Step='Official driver catalog';Status='Needs attention';Detail=$_.Exception.Message}) }
-    }
+    Write-Host 'Manufacturer catalog work runs independently in the Manufacturer terminal. This window continues hardware-ID/publisher matching.'
     try { Invoke-VerifiedPublisherDrivers $allIds $cache } catch { Write-Warning "Publisher matching failed: $($_.Exception.Message)" }
     Invoke-DriverRescan
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
@@ -827,34 +871,82 @@ function Show-DriverProblems {
         @{Name='HardwareID';Expression={@($_.HardwareID)[0]}} | Format-Table -Wrap -AutoSize | Out-Host
 }
 
-function Set-ExtraCleanup {
-    Write-Host "`nExtra cleanup:"
-    Write-Host '0) Keep defaults'
-    Write-Host '1) Reduce interface effects'
-    Write-Host '2) Reduce effects AND remove new Outlook, Phone Link and Get Help (including app data)'
-    Write-Host '3) RADICAL: option 2 + disable Defender real-time protection, Windows Update and indexing; restrict Store'
-    Write-Host 'Options 0/1/2 keep security services. They do not undo an earlier radical preset.'
-    Write-Warning 'Option 3 reduces protection and automatic maintenance; future update/driver scans may need services re-enabled. Faster performance is not guaranteed.'
-    do { $choice = Read-Host 'Choose 0, 1, 2 or 3' } until ($choice -in @('0','1','2','3'))
-    $script:RadicalRequested = $choice -eq '3'
-    if ($choice -eq '0') { return }
-    Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'EnableTransparency' 0
-    Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarAnimations' 0
-    $metrics = 'HKCU:\Control Panel\Desktop\WindowMetrics'
-    if (-not (Test-Path -LiteralPath $metrics)) { New-Item -Path $metrics -Force | Out-Null }
-    New-ItemProperty -Path $metrics -Name 'MinAnimate' -Value '0' -PropertyType String -Force | Out-Null
-    if ($choice -in @('2','3')) {
-        foreach ($name in @('Microsoft.OutlookForWindows','Microsoft.YourPhone','Microsoft.GetHelp')) {
-            Invoke-Step "Optional removal: $name" {
-                Get-AppxPackage -AllUsers -Name $name | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers }
-                Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq $name |
-                    ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName | Out-Null }
-            }
+function Select-DebloatLevel {
+    Write-Host "`nDebloat level (first debloat question):"
+    Write-Host '1) NORMAL - recommended: default app cleanup, privacy/AI/ads, keep everyday Windows tools and security'
+    Write-Host '2) HIGH - minimal resources: more optional apps, reduced effects and background apps; keep security/update/store services'
+    Write-Host '3) RADICAL - almost all catalogued optional apps plus service/security restrictions, for very slow PCs'
+    Write-Warning 'Radical reduces Defender real-time protection, Windows Update, Store access and indexing after installations finish. It can break features. Normal/High do not undo a previous Radical run.'
+    do { $selected = Microsoft.PowerShell.Utility\Read-Host 'Choose 1, 2 or 3' } until ($selected -in @('1','2','3'))
+    return [int]$selected
+}
+
+function Get-DebloatProfile {
+    param([ValidateRange(1,3)][int]$Level)
+    $rap = @('DisableTelemetry','DisableSuggestions','DisableEdgeAds','DisableLockscreenTips','DisableBing',
+        'DisableStoreSearchSuggestions','DisableCopilot','DisableRecall','DisableClickToDo','DisableAISvcAutoStart',
+        'DisableWidgets','HideChat','ShowKnownFileExt','DisableDragTray','Hide3dObjects','DisableDVR',
+        'DisableGameBarIntegration','DisableStartPhoneLink','DisableStartRecommended','DisableDeliveryOptimization',
+        'PreventUpdateAutoReboot','DisableUpdateASAP','EnableDarkMode','ExplorerToThisPC','EnableEndTask','HideSearchTb','HideTaskview')
+    $ctt = @('WPFTweaksActivity','WPFTweaksConsumerFeatures','WPFTweaksDeliveryOptimization','WPFTweaksDisableExplorerAutoDiscovery')
+    if ($Level -ge 2) {
+        $rap += @('DisableTransparency','DisableAnimations','DisableEdgeAI','DisablePaintAI',
+            'DisableNotepadAI','DisableBraveBloat','DisableSettings365Ads','DisableSettingsHome','DisableDesktopSpotlight',
+            'HideDesktopSpotlightIcon','HideHome','HideGallery','HideTabsInAltTab')
+        $ctt += @('WPFTweaksDisplay','WPFTweaksDisableBGapps','WPFTweaksEdgeDebloat','WPFTweaksBraveDebloat')
+    }
+    if ($Level -eq 3) {
+        $rap += @('DisableNotifications','DisableLocationServices','DisableFindMyDevice','DisableDeviceAutoAppDownload','ClearStart')
+        $ctt += @('WPFTweaksServices','WPFTweaksReservedStorage','WPFTweaksStorage')
+    }
+    [pscustomobject]@{Level=$Level;Name=@('Normal','High','Radical')[$Level-1];Raphire=@($rap|Select-Object -Unique);Titus=@($ctt|Select-Object -Unique)}
+}
+
+function Get-DebloatAppSelection {
+    param([object[]]$Apps,[int]$Level)
+    $core = '^(Microsoft\.(Edge|WindowsStore|WindowsTerminal|DesktopAppInstaller)|XPFFTQ037JWMHS)$'
+    $everyday = @('Microsoft.GetHelp','Microsoft.WindowsCalculator','Microsoft.WindowsNotepad','Microsoft.Paint',
+        'Microsoft.Windows.Photos','Microsoft.WindowsCamera','Microsoft.ScreenSketch')
+    foreach ($app in $Apps) {
+        foreach ($id in @($app.AppId)) {
+            if ($id -match $core) { continue }
+            if ($id -match 'HPPowerManager|LenovoVantage|LenovoCompanion') { continue }
+            $remove = [bool]$app.SelectedByDefault
+            if ($Level -ge 2 -and $app.Recommendation -eq 'optional' -and $id -notin $everyday) { $remove = $true }
+            if ($Level -eq 3) { $remove = $true }
+            if ($remove) { $id }
         }
     }
-    Write-Host 'Extra settings applied. Sign out/restart to refresh all interface effects.'
-    if ($script:RadicalRequested) { Write-Host 'Radical service changes are queued until apps and drivers finish.' }
 }
+
+function Invoke-TitusProfile {
+    param([object]$Profile)
+    # Reviewed release; a newer upstream release is not silently granted additional actions.
+    $file = Join-Path $runDir 'winutil-26.10.07.ps1'
+    Get-Download 'https://github.com/ChrisTitusTech/winutil/releases/download/26.10.07/winutil.ps1' $file `
+        -Sha256 'eeae69922fbe6354ea4e2a37f705eaa17bdaf45cc7889618a313178a513b13ee'
+    $config = Join-Path $runDir 'titus-profile.json'
+    ConvertTo-Json -InputObject @($Profile.Titus) | Set-Content -LiteralPath $config -Encoding UTF8
+    $log = Join-Path $runDir 'titus.log'
+    & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $file -Config $config *> $log
+    if ($LASTEXITCODE -ne 0) { throw "Chris Titus profile returned $LASTEXITCODE. See titus.log." }
+}
+
+function Select-ContextMenuStyle {
+    Write-Host "`nRight-click menu:"
+    Write-Host '1) Windows 11 new menu'
+    Write-Host '2) Classic full menu (Windows 10 style)'
+    do { $choice = Read-Host 'Choose 1 or 2' } until ($choice -in @('1','2'))
+    $classic = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
+    if ($choice -eq '2') {
+        if (-not (Test-Path -LiteralPath $classic)) { New-Item -Path $classic -Force | Out-Null }
+        Set-Item -LiteralPath $classic -Value ''
+    } elseif (Test-Path -LiteralPath $classic) { Remove-Item -LiteralPath $classic -Recurse -Force }
+    $script:ContextMenuChoice = [int]$choice
+    Write-Host 'Menu preference saved. Sign out/restart to refresh Explorer fully.'
+}
+
+
 
 function Set-RadicalPreset {
     $stateFolder = Join-Path $env:ProgramData 'FreshWindowsSetup\State'
@@ -1107,7 +1199,12 @@ function Invoke-DriverWorkflow {
     Write-Host '2) SDIO graphical interface'
     Write-Host '3) Automatic official driver catalogs + hardware-ID fallback WITHOUT SDI'
     Write-Host '4) Original SDI graphical interface'
-    do { $method = Read-Host 'Choose 1, 2, 3 or 4' } until ($method -in @('1','2','3','4'))
+    if (-not $script:FinalReviewOpen) {
+        $method = '3'
+        Write-Host 'Automatic phase: using official catalogs/hardware matching (option 3). SDIO/SDI choices are available during final review.'
+    } else {
+        do { $method = Read-Host 'Choose 1, 2, 3 or 4' } until ($method -in @('1','2','3','4'))
+    }
     $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDIO' }; '3' { 'Internet hardware-ID search' }; '4' { 'SDI' } }
     $automatic = $method -eq '1'
     do {
@@ -1232,6 +1329,40 @@ function Disable-UnwantedStartup {
     Write-Host 'Defender, Lightshot, NetTime, Ditto and Intel/AMD/NVIDIA utilities are preserved.'
 }
 
+function Get-ChromeExecutable {
+    @((Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')) |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+
+function Install-ChromeVerified {
+    $wingetOk = $false
+    try { Install-WingetApp 'Google.Chrome'; $wingetOk = $true }
+    catch { Write-Warning "Chrome WinGet install/update failed: $($_.Exception.Message). Trying Google's MSI." }
+    $chrome = Get-ChromeExecutable
+    if (-not $wingetOk -or -not $chrome) {
+        $msi = Join-Path $runDir 'GoogleChromeStandaloneEnterprise64.msi'
+        Get-Download 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi' $msi -Publisher 'Google'
+        $log = Join-Path $runDir 'chrome-msi.log'
+        Invoke-Installer "$env:SystemRoot\System32\msiexec.exe" ('/i "' + $msi + '" /qn /norestart ALLUSERS=1 /L*v "' + $log + '"')
+        $chrome = Get-ChromeExecutable
+    }
+    if (-not $chrome) { throw 'Chrome executable is missing after installation. See chrome-msi.log and the Apps report.' }
+    $version = (Get-Item -LiteralPath $chrome).VersionInfo.ProductVersion
+    if (-not $version) { throw 'Chrome executable has no readable version information.' }
+    $desktop = [Environment]::GetFolderPath('DesktopDirectory')
+    if ($desktop) {
+        if (-not (Test-Path -LiteralPath $desktop)) { New-Item -ItemType Directory -Path $desktop -Force | Out-Null }
+        $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $desktop 'Google Chrome.lnk'))
+        $shortcut.TargetPath = $chrome
+        $shortcut.WorkingDirectory = Split-Path $chrome -Parent
+        $shortcut.IconLocation = $chrome + ',0'
+        $shortcut.Save()
+    }
+    Write-Host "Chrome verified: $version | $chrome | desktop shortcut created."
+}
+
 function Install-WingetApp {
     param([string]$Id)
     if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
@@ -1299,6 +1430,13 @@ try {
         throw 'Restore-point step failed. Resolve it and run the BAT again.'
     }
     Set-Content -LiteralPath (Join-Path $runDir 'restore-ready.txt') -Value 'Restore point verified'
+    Set-Content -LiteralPath (Join-Path $runDir 'coordinator-process.txt') -Value $PID
+    if (-not $SkipDebloat) {
+        if ($DebloatLevel -eq 0) { $DebloatLevel = Select-DebloatLevel }
+        $script:DebloatProfile = Get-DebloatProfile $DebloatLevel
+        $script:RadicalRequested = $DebloatLevel -eq 3
+        Write-Host ('Selected debloat profile: ' + $script:DebloatProfile.Name)
+    }
 
     Invoke-Step 'WinGet availability' {
         if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
@@ -1316,9 +1454,9 @@ try {
 
     Invoke-Step 'Edge default-browser preference and direct setup links' { Set-EdgeDefaultPreference }
     # Workers inherit the elevated token and each get a visible, separate console.
-    foreach ($kind in @('Apps','Office','Drivers')) {
+    foreach ($kind in @('Apps','Office','Drivers','Manufacturer')) {
         if ($kind -eq 'Office' -and $SkipOffice) { continue }
-        if ($kind -eq 'Drivers' -and $SkipDrivers) { continue }
+        if ($kind -in @('Drivers','Manufacturer') -and $SkipDrivers) { continue }
         if ($kind -eq 'Apps' -and $SkipApps -and $SkipGpu -and $SkipNetTime) { continue }
         Invoke-Step "Start $kind terminal" {
             $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Worker ' + $kind + ' -RunRoot "' + $runDir + '"'
@@ -1332,9 +1470,9 @@ try {
     Write-Host 'App, Office and driver terminals are running while this terminal applies tweaks.'
     }
 
-    if ($Worker -eq 'Coordinator') {
+    if ($Worker -eq 'Coordinator' -and -not $SkipDebloat) {
     if (-not $SkipDebloat) {
-        Invoke-Step 'Raphire default tweaks and default bloatware removal' {
+        Invoke-Step 'Raphire selected debloat profile and app removal' {
             # Resolve the latest stable upstream release, pin it for this run and log its hash.
             $release = Invoke-RestMethod 'https://api.github.com/repos/Raphire/Win11Debloat/releases/latest'
             $tag = [uri]::EscapeDataString($release.tag_name)
@@ -1348,13 +1486,25 @@ try {
             $debloater = Join-Path $runDir "Raphire\Win11Debloat-$revision\Win11Debloat.ps1"
             # The coordinator already verified a restore point before launching workers.
             # Avoid a second snapshot while concurrent installations are in progress.
-            $defaultsPath = Join-Path (Split-Path $debloater -Parent) 'Config\DefaultSettings.json'
-            $defaults = Get-Content -LiteralPath $defaultsPath -Raw | ConvertFrom-Json
-            $defaults.Settings = @($defaults.Settings | Where-Object { $_.Name -ne 'CreateRestorePoint' })
-            $defaults | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $defaultsPath -Encoding UTF8
+            $basePath = Split-Path $debloater -Parent
+            $available = (Get-Content (Join-Path $basePath 'Config\Features.json') -Raw | ConvertFrom-Json).Features.FeatureId
+            $appCatalog = (Get-Content (Join-Path $basePath 'Config\Apps.json') -Raw | ConvertFrom-Json).Apps
+            $cttAppFile = Join-Path $runDir 'titus-appx-catalog.json'
+            Get-Download 'https://raw.githubusercontent.com/ChrisTitusTech/winutil/26.10.07/config/appx.json' $cttAppFile
+            $cttApps = Get-Content -LiteralPath $cttAppFile -Raw | ConvertFrom-Json
+            $appCatalog = @($appCatalog) + @($cttApps.PSObject.Properties | ForEach-Object {
+                [pscustomobject]@{AppId=$_.Value.PackageId;FriendlyName=$_.Value.Content;Recommendation='optional';SelectedByDefault=$false}
+            })
+            $selectedApps = @(Get-DebloatAppSelection $appCatalog $DebloatLevel | Select-Object -Unique)
+            $settings = @($script:DebloatProfile.Raphire | Where-Object { $_ -in $available } |
+                ForEach-Object { [pscustomobject]@{Name=$_;Value=$true} })
+            $profilePath = Join-Path $runDir 'raphire-profile.json'
+            [pscustomobject]@{Version='1.0';Apps=$selectedApps;Tweaks=$settings} |
+                ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $profilePath -Encoding UTF8
+            Write-Host "Profile $DebloatLevel`: $($settings.Count) Raphire settings, $($selectedApps.Count) catalogued apps selected."
             $debloatLog = Join-Path $runDir 'raphire.log'
             & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile `
-                -ExecutionPolicy Bypass -File $debloater -CLI -Silent -RunDefaults -RemoveApps `
+                -ExecutionPolicy Bypass -File $debloater -CLI -Silent -Config $profilePath `
                 -AppRemovalTarget AllUsers -SkipExplorerRestart -LogPath $debloatLog
             if ($LASTEXITCODE -ne 0) { throw "Raphire returned $LASTEXITCODE. See raphire.log." }
             # Upstream logs per-feature failures without necessarily returning a failure exit code.
@@ -1364,9 +1514,10 @@ try {
                 }
             }
         }
+        Invoke-Step 'Chris Titus reviewed profile selections' { Invoke-TitusProfile $script:DebloatProfile }
     }
 
-    Invoke-Step 'Dark theme, classic right-click, clean taskbar and End task' {
+    Invoke-Step 'Dark theme, clean taskbar and End task' {
         $advanced = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
         $personalize = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
         Set-Dword $personalize 'AppsUseLightTheme' 0
@@ -1377,9 +1528,6 @@ try {
         Set-Dword $advanced 'ShowCopilotButton' 0
         Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0
         Set-Dword "$advanced\TaskbarDeveloperSettings" 'TaskbarEndTask' 1
-        $classic = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
-        if (-not (Test-Path -LiteralPath $classic)) { New-Item -Path $classic -Force | Out-Null }
-        Set-Item -Path $classic -Value ''
         Write-Host 'End task appears when right-clicking a running app on the taskbar (Windows label follows your language).'
         Write-Host 'Sign out or restart after setup to refresh the desktop.'
     }
@@ -1431,16 +1579,15 @@ namespace FreshWindowsSetup {
             [UIntPtr]::Zero, 'ImmersiveColorSet', 2, 2000, [ref]$messageResult)
         Write-Host 'Both dark-theme settings and Explorer LaunchTo=This PC verified.'
     }
-    Invoke-Step 'Optional extra cleanup and interface performance' { Set-ExtraCleanup }
-    Invoke-Step 'Choose power profile' { Set-PowerProfile }
-    Write-Host 'Tweaks finished. Waiting for the other terminals...'
+    Write-Host 'Automatic tweaks finished. Waiting for automatic installations before cleanup and final questions...'
 
     } # Coordinator tweaks
 
     if ($Worker -eq 'Apps') {
     if (-not $SkipApps) {
+        Invoke-Step 'Install/update Google Chrome and verify executable' { Install-ChromeVerified }
         foreach ($id in @(
-            'Google.Chrome', 'Brave.Brave', 'Microsoft.Edge', 'VideoLAN.VLC',
+            'Brave.Brave', 'Microsoft.Edge', 'VideoLAN.VLC',
             '7zip.7zip', 'Ditto.Ditto', 'ALCPU.CoreTemp',
             'Geeks3D.FurMark.2', 'Skillbrains.Lightshot', 'IObit.IObitUnlocker'
         )) { Invoke-Step "Install/update $id" { Install-WingetApp $id } }
@@ -1560,6 +1707,22 @@ namespace FreshWindowsSetup {
     if ($Worker -eq 'Drivers' -and -not $SkipDrivers) {
         Invoke-Step 'SDIO drivers and retry/original-SDI menu' { Invoke-DriverWorkflow }
     }
+    if ($Worker -eq 'Manufacturer' -and -not $SkipDrivers) {
+        Invoke-Step 'Manufacturer official driver catalog scan/download/install' {
+            $computer = Get-CimInstance Win32_ComputerSystem
+            $inventory = @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 22 })
+            $ids = @($inventory | ForEach-Object { @($_.HardwareID) + @($_.CompatibleID) } | Where-Object { $_ } | Select-Object -Unique)
+            $cache = Join-Path $env:ProgramData 'FreshWindowsSetup\DriverTools\HardwareWeb'
+            foreach ($folder in @((Join-Path $env:ProgramData 'FreshWindowsSetup'),(Join-Path $env:ProgramData 'FreshWindowsSetup\DriverTools'),$cache)) {
+                if (Test-Path -LiteralPath $folder) {
+                    if ((Get-Item -LiteralPath $folder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Manufacturer cache cannot be a link.' }
+                } else { New-Item -ItemType Directory -Path $folder | Out-Null }
+            }
+            Invoke-OemDriverCatalog $computer $cache $ids
+            Invoke-DriverRescan
+            Show-DriverProblems
+        }
+    }
 
     if ($Worker -eq 'Office' -and -not $SkipOffice) {
         Invoke-Step 'Office 2024 Pro Plus x64 pt-PT from original Microsoft C2R installer' {
@@ -1630,7 +1793,8 @@ try {
     if ($Worker -eq 'Coordinator') {
         foreach ($job in $script:Workers) {
             $statusPath = Join-Path $runDir ('status-' + $job.Kind + '.json')
-            while (-not (Test-Path -LiteralPath $statusPath)) {
+            $readyPath = Join-Path $runDir ('ready-' + $job.Kind + '.txt')
+            while (-not (Test-Path -LiteralPath $statusPath) -and -not (Test-Path -LiteralPath $readyPath)) {
                 $job.Process.Refresh()
                 if ($job.Process.HasExited) {
                     $script:Results.Add([pscustomobject]@{Step=$job.Kind;Status='Needs attention';Detail='Worker exited without a report. Check its terminal.'})
@@ -1638,18 +1802,20 @@ try {
                 }
                 Start-Sleep -Seconds 2
             }
-            if (Test-Path -LiteralPath $statusPath) {
-                foreach ($result in @(Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json)) {
-                    $script:Results.Add($result)
-                }
-            }
         }
         # Run these after apps/Office/driver workers, so installers cannot recreate the entries afterwards.
-        Invoke-Step 'Uninstall OneDrive' { Remove-OneDrive }
-        Invoke-Step 'Uninstall Xbox components' { Remove-Xbox }
-        Invoke-Step 'Disable unwanted startup programs' { Disable-UnwantedStartup }
-        if ($script:RadicalRequested) { Invoke-Step 'Apply selected radical preset after installations' { Set-RadicalPreset } }
-        Invoke-Step 'Refresh File Explorer and dark mode' {
+        if (-not $SkipDebloat) {
+            Invoke-Step 'Uninstall OneDrive' { Remove-OneDrive }
+            Invoke-Step 'Uninstall Xbox components' { Remove-Xbox }
+        }
+        if (-not $SkipApps -or -not $SkipDebloat) { Invoke-Step 'Disable unwanted startup programs' { Disable-UnwantedStartup } }
+        if (-not $SkipApps) {
+            Invoke-Step 'Final automatic Chrome presence check' {
+                if (-not (Get-ChromeExecutable)) { Install-ChromeVerified }
+                else { Write-Host ('Chrome present: ' + (Get-ChromeExecutable)) }
+            }
+        }
+        if (-not $SkipDebloat) { Invoke-Step 'Refresh File Explorer and dark mode' {
             # Reapply after installers, which can modify desktop preferences.
             Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 0
             Set-Dword 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'SystemUsesLightTheme' 0
@@ -1661,12 +1827,34 @@ try {
             # Terminate only this user's Explorer shell in the current session.
             Get-Process explorer -ErrorAction SilentlyContinue | Where-Object SessionId -eq $sessionId | Stop-Process -Force
             Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ArgumentList 'shell:MyComputerFolder'
+        } }
+        Write-Host 'Automatic installations, removals and baseline tweaks are complete. Final choices and retry menus are now available.'
+        Set-Content -LiteralPath (Join-Path $runDir 'final-review.txt') -Value 'Automatic cleanup complete'
+        if (-not $SkipDebloat) {
+            Invoke-Step 'Final right-click menu preference' { Select-ContextMenuStyle }
+            Invoke-Step 'Final power profile choice' { Set-PowerProfile }
         }
+        foreach ($job in $script:Workers) {
+            $statusPath = Join-Path $runDir ('status-' + $job.Kind + '.json')
+            while (-not (Test-Path -LiteralPath $statusPath)) {
+                $job.Process.Refresh()
+                if ($job.Process.HasExited) { break }
+                Start-Sleep -Seconds 1
+            }
+            if (Test-Path -LiteralPath $statusPath) {
+                foreach ($result in @(Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json)) { $script:Results.Add($result) }
+            } else { $script:Results.Add([pscustomobject]@{Step=$job.Kind;Status='Needs attention';Detail='Worker exited without a final report.'}) }
+        }
+        if ($script:RadicalRequested) { Invoke-Step 'Apply selected radical preset after all installation/retry work' { Set-RadicalPreset } }
+        Write-Host 'Tweaks finished.'
     }
 } catch {
     Write-Warning $_.Exception.Message
     $script:Results.Add([pscustomobject]@{Step="$Worker fatal error";Status='Needs attention';Detail=$_.Exception.Message})
 } finally {
+    if ($Worker -eq 'Coordinator' -and -not (Test-Path -LiteralPath (Join-Path $runDir 'final-review.txt'))) {
+        Set-Content -LiteralPath (Join-Path $runDir 'final-review.txt') -Value 'Coordinator ended; review outstanding work'
+    }
     $reportName = if ($Worker -eq 'Coordinator') { 'report.csv' } else { 'report-' + $Worker + '.csv' }
     $script:Results | Export-Csv -Path (Join-Path $runDir $reportName) -NoTypeInformation -Encoding UTF8
     $script:Results | Format-Table -AutoSize
@@ -1688,9 +1876,6 @@ try {
     Stop-Transcript | Out-Null
 }
 Read-Host 'This terminal finished. Press Enter to close it' | Out-Null
-if ($Worker -eq 'Drivers' -and -not $SkipDrivers) {
-    Invoke-Step 'Delete SDIO and SDI downloads on driver terminal exit' { Remove-DriverToolFiles }
-}
 if ($Worker -eq 'Coordinator') {
     foreach ($job in $script:Workers) {
         $job.Process.Refresh()
@@ -1706,6 +1891,7 @@ if ($Worker -eq 'Coordinator') {
     }
 }
 if ($Worker -eq 'Coordinator') {
+    if (-not $SkipDrivers) { Invoke-Step 'Delete driver-tool downloads after all worker terminals exit' { Remove-DriverToolFiles } }
     try { Save-SetupState } catch { Write-Warning "Could not save last-run state: $($_.Exception.Message)" }
 }
 if ($Worker -eq 'Coordinator' -and $CleanSetupFiles) {
