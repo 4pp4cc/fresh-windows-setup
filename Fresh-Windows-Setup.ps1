@@ -295,7 +295,7 @@ function Test-OfficialDriverUrl {
         if ($uri.Host -eq 'www.microsoft.com' -and $uri.AbsolutePath -match 'microsoft-365|outlook|log-in') { return $false }
         foreach ($domain in @('dell.com','hp.com','lenovo.com','asus.com','acer.com','msi.com',
             'gigabyte.com','asrock.com','intel.com','amd.com','nvidia.com','realtek.com',
-            'realtek.com.tw','qualcomm.com','mediatek.com','microsoft.com','surface.com','coolstar.org','coolstar.moe')) {
+            'realtek.com.tw','qualcomm.com','mediatek.com','microsoft.com','surface.com','coolstar.org','coolstar.moe','ati.com')) {
             if ($uri.Host -eq $domain -or $uri.Host.EndsWith('.' + $domain)) { return $true }
         }
     } catch { }
@@ -316,12 +316,127 @@ function Test-InfHardwareMatch {
     return $false
 }
 
+function Get-DriverIdVariants {
+    param([string[]]$Ids)
+    $variants = @($Ids | Where-Object { $_ })
+    $variants += @($Ids | ForEach-Object { $_ -replace '&REV_[0-9A-F]+','' })
+    foreach ($id in $Ids) {
+        if ($id -match '^(PCI\\VEN_[0-9A-F]{4}&DEV_[0-9A-F]{4}|USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4})') { $variants += $Matches[1] }
+    }
+    return @($variants | Where-Object { $_ } | Select-Object -Unique)
+}
+
 function Get-DriverSearchQueries {
-    param([string[]]$Ids,[string]$Context)
-    $queries = @($Ids | Select-Object -First 2 | ForEach-Object { '"' + $_ + '" driver' })
-    # Keep punctuation and device IDs intact. Model information is only a fallback.
-    if ($Context) { $queries += '"' + ($Ids[0] -split '\\')[-1] + '" driver ' + $Context }
-    return @($queries | Select-Object -Unique)
+    param([string[]]$Ids,[string]$Context,[string]$DeviceName)
+    $variants = @(Get-DriverIdVariants $Ids)
+    if (-not $variants.Count) { return @() }
+    $selected = @($Ids[0],($Ids[0] -replace '&REV_[0-9A-F]+',''))
+    $base = @($variants | Where-Object { $_ -match '^(PCI\\VEN_[0-9A-F]{4}&DEV_[0-9A-F]{4}|USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4})$' } | Select-Object -First 1)
+    $selected += $base
+    if ($Ids.Count -gt 1) { $selected += $Ids[1] -replace '&REV_[0-9A-F]+','' }
+    $queries = @($selected | Select-Object -Unique | ForEach-Object { '"' + $_ + '" driver' })
+    if ($Context) { $queries += '"' + (($selected | Select-Object -Last 1) -split '\\')[-1] + '" driver ' + $Context }
+    if ($DeviceName -and $Context -and $DeviceName -notmatch 'Microsoft|Unknown|Generic|Desconhecido|Gen.rico') { $queries += '"' + $DeviceName + '" driver ' + $Context }
+    return @($queries | Select-Object -Unique -First 6)
+}
+
+function Expand-DriverContainer {
+    param([string]$Archive,[string]$Destination,[switch]$TrustedPayload)
+    $seven = @((Join-Path $env:ProgramFiles '7-Zip\7z.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $seven) { throw '7-Zip is not installed yet. Retry after the Apps terminal installs it.' }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    if ((Get-Item -LiteralPath $Destination -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Extraction destination cannot be a link.' }
+    $listing = @(& $seven l -slt -p- $Archive 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        if ($TrustedPayload -and [IO.Path]::GetExtension($Archive) -eq '.exe') {
+            $bytes = [IO.File]::ReadAllBytes($Archive)
+            $unicode = [Text.Encoding]::Unicode.GetString($bytes)
+            $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+            if (($unicode.Contains('extract_all:') -or $ascii.Contains('extract_all:')) -and
+                ($unicode.Contains('InstallShield') -or $ascii.Contains('InstallShield'))) {
+                # Revenera documents this as extraction only. Used only inside a verified publisher package.
+                Write-Host 'Extracting verified publisher payload with InstallShield /extract_all (no driver setup).'
+                Invoke-Installer $Archive ('/extract_all:"' + $Destination + '"') 2
+                return $true
+            }
+        }
+        return $false
+    }
+    $entries = $false
+    foreach ($line in $listing) {
+        if ([string]$line -match '^----------') { $entries = $true; continue }
+        if (-not $entries) { continue }
+        if ([string]$line -match '^(Symbolic Link|Hard Link) =') { throw 'Linked archive entry rejected.' }
+        if ([string]$line -match '^Path = (.+)$') {
+            $relative = $Matches[1].TrimStart([char]92,[char]47)
+            if ($relative.Contains(':')) { throw 'Absolute archive entry rejected.' }
+            $target = [IO.Path]::GetFullPath((Join-Path $Destination $relative))
+            if (-not $target.StartsWith($Destination.TrimEnd('\') + '\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Archive traversal rejected.' }
+        }
+    }
+    Invoke-Installer $seven ('x "' + $Archive + '" -o"' + $Destination + '" -y -p- -bd -bso0 -bsp0') 5
+    return $true
+}
+
+function Get-DirectDriverCandidates {
+    param([string[]]$Ids)
+    # Hardware-based registry: applies across computer brands/models, never forces an INF match.
+    $baseIds = @(Get-DriverIdVariants $Ids)
+    if ($baseIds -contains 'USB\VID_03F0&PID_311D') {
+        [pscustomobject]@{Name='HP Qualcomm Atheros Bluetooth';Url='https://ftp.hp.com/pub/softpaq/sp72001-72500/sp72163.exe';Publisher='HP Inc\.|Hewlett-Packard';Note='Vendor package lists Windows 10, not Windows 11. Package/INF matching is attempted; error 43 may remain.'}
+    }
+    if ($baseIds -contains 'PCI\VEN_1002&DEV_6760') {
+        [pscustomobject]@{Name='AMD Catalyst legacy graphics';Url='https://www2.ati.com/drivers/amd-catalyst-15.7.1-win10-64bit.exe';Publisher='Advanced Micro Devices|ATI Technologies';Note='Legacy Windows 10 package; Windows 11 and laptop switchable graphics are not guaranteed. Current Adrenalin is not a substitute for this legacy driver.'}
+    }
+}
+
+function Invoke-DirectDriverPackages {
+    param([string[]]$Ids,[string]$Cache,[object[]]$Candidates)
+    if (-not $PSBoundParameters.ContainsKey('Candidates')) { $Candidates = @(Get-DirectDriverCandidates $Ids) }
+    foreach ($candidate in $Candidates) {
+        try {
+            if (-not (Test-OfficialDriverUrl $candidate.Url)) { throw 'Unsupported publisher source.' }
+            Write-Host "Direct publisher candidate: $($candidate.Name)"
+            Write-Warning $candidate.Note
+            $hashProvider = [Security.Cryptography.SHA256]::Create()
+            try { $prefix = ([BitConverter]::ToString($hashProvider.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate.Url)))).Replace('-','').Substring(0,16) }
+            finally { $hashProvider.Dispose() }
+            $name = $prefix + '-' + [IO.Path]::GetFileName(([uri]$candidate.Url).AbsolutePath)
+            $archive = Join-Path $Cache $name
+            $root = Join-Path $Cache ([IO.Path]::GetFileNameWithoutExtension($name))
+            $ready = Join-Path $root 'extract-ready.txt'
+            if (-not (Test-Path -LiteralPath $archive)) {
+                Get-Download $candidate.Url $archive -Publisher $candidate.Publisher -Headers @{Referer='https://www.amd.com/'}
+            } else {
+                $sig = Get-AuthenticodeSignature -LiteralPath $archive
+                if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch $candidate.Publisher) { throw 'Cached publisher signature invalid.' }
+                Write-Host 'Reusing previously downloaded publisher package.'
+            }
+            if (-not (Test-Path -LiteralPath $ready)) {
+                if (-not (Expand-DriverContainer $archive $root -TrustedPayload)) { throw 'Package format is not supported by the archive extractor.' }
+                # Read nested containers without executing their installer code.
+                $seen = @{}
+                $count = 0
+                for ($depth=0; $depth -lt 5; $depth++) {
+                    $nested = @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object {
+                        $_.Extension -in @('.cab','.msi','.exe') -and -not $seen.ContainsKey($_.FullName) -and $_.Name -notmatch '^(dev32|dev64|dpinst|win732)\.exe$' } | Select-Object -First 12)
+                    if (-not $nested.Count) { break }
+                    foreach ($item in $nested) {
+                        if ($count -ge 24) { break }
+                        $seen[$item.FullName] = $true
+                        $count++
+                        $destination = Join-Path $item.DirectoryName ($item.Name + '.contents')
+                        [void](Expand-DriverContainer $item.FullName $destination -TrustedPayload)
+                    }
+                    if ($count -ge 24) { break }
+                }
+                if (-not @(Get-ChildItem -LiteralPath $root -Filter '*.inf' -Recurse -File).Count) { throw 'No extractable INF drivers found. This installer format needs a separate supported adapter; it was not executed.' }
+                Set-Content -LiteralPath $ready -Value 'Extraction completed'
+            }
+            Install-MatchingInfDrivers $root $Ids
+        } catch { Write-Warning "Direct package could not complete: $($_.Exception.Message)" }
+    }
 }
 
 function Install-MatchingInfDrivers {
@@ -397,9 +512,11 @@ function Invoke-VerifiedPublisherDrivers {
 function Get-DriverSearchPages {
     param([string]$Query,[string[]]$Ids)
     if (-not $script:DriverSearchCache) { $script:DriverSearchCache = @{} }
+    if (-not $script:DriverSearchFailures) { $script:DriverSearchFailures = @{} }
     if ($script:DriverSearchCache.ContainsKey($Query)) { return $script:DriverSearchCache[$Query] }
     foreach ($provider in @('Brave API','Bing RSS','DuckDuckGo HTML')) {
         if ($provider -eq 'Brave API' -and -not $env:BRAVE_SEARCH_API_KEY) { continue }
+        if ($script:DriverSearchFailures[$provider] -ge 2) { continue }
         try {
             $urls = @()
             switch ($provider) {
@@ -418,7 +535,10 @@ function Get-DriverSearchPages {
                 'DuckDuckGo HTML' {
                     Write-Host 'Trying DuckDuckGo search.'
                     $response = Invoke-WebRequest -UseBasicParsing -Uri ('https://html.duckduckgo.com/html/?q=' + [uri]::EscapeDataString($Query)) -TimeoutSec 30
-                    if ($response.Content -match 'challenge-form|anomaly-modal') { throw 'CAPTCHA requested; moving on without solving/bypassing it.' }
+                    if ($response.Content -match 'challenge-form|anomaly-modal') {
+                        $script:DriverSearchFailures[$provider] = 2
+                        throw 'CAPTCHA requested; source disabled for this run.'
+                    }
                     $urls = @([regex]::Matches($response.Content, '(?i)uddg=([^&"<>]+)') |
                         ForEach-Object { [uri]::UnescapeDataString($_.Groups[1].Value) })
                 }
@@ -440,12 +560,18 @@ function Get-DriverSearchPages {
             } | Select-Object -Unique -First 4)
             if ($pages.Count) { $script:DriverSearchCache[$Query] = $pages; return $pages }
             Write-Host "$provider returned no supported manufacturer links; trying the next source."
+            # No result for an exact ID is not a provider outage: broader ID queries must still run.
         } catch {
             # Do not print API response bodies or headers, which may include credentials.
             Write-Warning "$provider unavailable or blocked. Trying the next source."
+            $script:DriverSearchFailures[$provider] = 1 + [int]$script:DriverSearchFailures[$provider]
         }
     }
-    Write-Warning 'No usable search source. Configure BRAVE_SEARCH_API_KEY for authenticated search, or retry later. No driver installation was inferred from this failure.'
+    $script:DriverSearchCache[$Query] = @()
+    if (-not $script:SearchUnavailableReported) {
+        Write-Warning 'Search sources returned no relevant results or were blocked. Blocked/failing sources will not be repeatedly queried in this run. Direct publisher matching remains available. BRAVE_SEARCH_API_KEY enables authenticated search.'
+        $script:SearchUnavailableReported = $true
+    }
     return @()
 }
 
@@ -453,7 +579,7 @@ function Invoke-AutomaticWebDrivers {
     Show-DriverProblems
     Invoke-DriverRescan
     Write-Host 'Searching the internet by hardware ID. No SDI and no Windows Update API.'
-    Write-Host 'Supported automatic packages: publisher INF packages and ZIP/CAB archives with matching signed drivers. Unsupported/blocked downloads remain unresolved.'
+    Write-Host 'Supported automatic packages: publisher INF packages, ZIP/CAB archives and verified extractable EXE containers. Only matching signed INF drivers are installed.'
     $computer = Get-CimInstance Win32_ComputerSystem
     $context = "$($computer.Manufacturer) $($computer.Model)"
     $cache = Join-Path $env:ProgramData 'FreshWindowsSetup\DriverTools\HardwareWeb'
@@ -466,23 +592,25 @@ function Invoke-AutomaticWebDrivers {
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
         Where-Object { $_.ConfigManagerErrorCode -ne 22 })
     $allIds = @($devices | ForEach-Object { $_.HardwareID } | Where-Object { $_ } | Select-Object -Unique)
+    Invoke-DirectDriverPackages $allIds $cache
     try { Invoke-VerifiedPublisherDrivers $allIds $cache } catch { Write-Warning "Publisher matching failed: $($_.Exception.Message)" }
     Invoke-DriverRescan
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
         Where-Object { $_.ConfigManagerErrorCode -ne 22 })
     foreach ($device in $devices) {
-        $ids = @($device.HardwareID | Where-Object { $_ })
+        $ids = @(@($device.HardwareID) + @($device.CompatibleID) | Where-Object { $_ } | Select-Object -Unique)
+        $searchIds = @(Get-DriverIdVariants $ids)
         if (-not $ids.Count) { Write-Warning "No hardware ID: $($device.Name)"; continue }
         Write-Host "`nSearching: $($device.Name) | $($ids[0]) | error $($device.ConfigManagerErrorCode)"
-        foreach ($query in @(Get-DriverSearchQueries $ids $context)) {
+        foreach ($query in @(Get-DriverSearchQueries $ids $context $device.Name)) {
             try {
                 Write-Host "Web query: $query"
-                $pages = @(Get-DriverSearchPages $query $ids)
+                $pages = @(Get-DriverSearchPages $query $searchIds)
                 if (-not $pages.Count) { Write-Warning "No relevant supported publisher results for $($ids[0])." }
                 foreach ($page in $pages) {
                     Write-Host "Manufacturer result: $page"
                     $urls = @()
-                    if (([uri]$page).AbsolutePath -match '\.(zip|cab)$') { $urls = @($page) }
+                    if (([uri]$page).AbsolutePath -match '\.(zip|cab|exe)$') { $urls = @($page) }
                     else {
                         $response = Invoke-WebRequest -UseBasicParsing -Uri $page -TimeoutSec 30
                         $finalPage = $response.BaseResponse.ResponseUri.AbsoluteUri
@@ -490,11 +618,17 @@ function Invoke-AutomaticWebDrivers {
                         $urls = @([regex]::Matches($response.Content, '(?i)href\s*=\s*["'']([^"'']+)["'']') |
                             ForEach-Object {
                                 try { ([uri]::new([uri]$finalPage,[Net.WebUtility]::HtmlDecode($_.Groups[1].Value))).AbsoluteUri } catch { }
-                            } | Where-Object { (Test-OfficialDriverUrl $_) -and ([uri]$_).AbsolutePath -match '\.(zip|cab)$' } |
+                            } | Where-Object { (Test-OfficialDriverUrl $_) -and ([uri]$_).AbsolutePath -match '\.(zip|cab|exe)$' } |
                             Select-Object -Unique -First 3)
                     }
                     foreach ($url in $urls) {
                         try {
+                            if (([uri]$url).AbsolutePath -match '\.exe$') {
+                                Invoke-DirectDriverPackages $ids $cache -Candidates @([pscustomobject]@{
+                                    Name='Signed publisher driver container';Url=$url;Publisher='.';
+                                    Note='Extracting a signed publisher container. Its complete driver installer will not be run.'})
+                                continue
+                            }
                             $sha = [Security.Cryptography.SHA256]::Create()
                             try { $key = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($url)))).Replace('-','').ToLowerInvariant() }
                             finally { $sha.Dispose() }
@@ -538,7 +672,7 @@ function Invoke-AutomaticWebDrivers {
 function Show-DriverProblems {
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
         Where-Object { $_.ConfigManagerErrorCode -ne 22 })
-    Write-Host "`nMissing/problem drivers (28 = missing driver):"
+    Write-Host "`nMissing/problem drivers (28 = missing; 10 = cannot start; 43 = device reported a problem):"
     if (-not $devices.Count) { Write-Host 'No enabled devices currently report a driver/device error.'; return }
     $devices | Select-Object Name,@{Name='Error';Expression={$_.ConfigManagerErrorCode}},
         @{Name='HardwareID';Expression={@($_.HardwareID)[0]}} | Format-Table -Wrap -AutoSize | Out-Host
