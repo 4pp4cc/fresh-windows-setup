@@ -98,7 +98,11 @@ function Get-Download {
     param([string]$Url, [string]$Destination, [string]$Sha256, [string]$Publisher,
         [switch]$AllowGpuSignatureFailure, [hashtable]$Headers = @{})
     if (([uri]$Url).Scheme -ne 'https') { throw 'Only HTTPS downloads are accepted.' }
-    Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination -Headers $Headers
+    $savedProgress = $ProgressPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination -Headers $Headers
+    } finally { $ProgressPreference = $savedProgress }
     $hash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
     Write-Host "Downloaded $(Split-Path $Destination -Leaf), SHA256: $hash"
     if ($Sha256 -and $hash -ne $Sha256) { throw "Checksum mismatch: $Destination" }
@@ -379,43 +383,169 @@ function Expand-DriverContainer {
     return $true
 }
 
-function Get-DirectDriverCandidates {
-    param([string[]]$Ids)
-    # Hardware-based registry: applies across computer brands/models, never forces an INF match.
-    $baseIds = @(Get-DriverIdVariants $Ids)
-    if ($baseIds -contains 'USB\VID_03F0&PID_311D') {
-        [pscustomobject]@{Name='HP Qualcomm Atheros Bluetooth';Url='https://ftp.hp.com/pub/softpaq/sp72001-72500/sp72163.exe';Publisher='HP Inc\.|Hewlett-Packard';Note='Vendor package lists Windows 10, not Windows 11. Package/INF matching is attempted; error 43 may remain.'}
+function ConvertFrom-DriverCatalogXml {
+    param([string]$Text)
+    $settings = New-Object Xml.XmlReaderSettings
+    $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $inputText = New-Object IO.StringReader($Text.TrimStart([char]0xfeff))
+    $reader = [Xml.XmlReader]::Create($inputText,$settings)
+    try {
+        $document = New-Object Xml.XmlDocument
+        $document.XmlResolver = $null
+        $document.Load($reader)
+        return ,$document
+    } finally { $reader.Dispose(); $inputText.Dispose() }
+}
+
+function Get-OemDriverCatalog {
+    param([ValidateSet('Dell','HP','Lenovo')][string]$Vendor,[string]$Cache)
+    if (-not $script:OemCatalogs) { $script:OemCatalogs = @{} }
+    if ($script:OemCatalogs.ContainsKey($Vendor)) { return ,$script:OemCatalogs[$Vendor] }
+    $folder = Join-Path $Cache 'Catalogs'
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    if ((Get-Item -LiteralPath $folder -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Catalog cache cannot be a link.' }
+    $xmlPath = Join-Path $folder ($Vendor + '.xml')
+    if ($Vendor -eq 'Lenovo') {
+        Get-Download 'https://download.lenovo.com/cdrt/td/catalogv2.xml' $xmlPath
+    } else {
+        $url = if ($Vendor -eq 'Dell') { 'https://downloads.dell.com/catalog/DriverPackCatalog.cab' }
+            else { 'https://ftp.hp.com/pub/caps-softpaq/cmit/HPClientDriverPackCatalog.cab' }
+        $cab = Join-Path $folder ($Vendor + '.cab')
+        Get-Download $url $cab
+        & "$env:SystemRoot\System32\expand.exe" $cab $xmlPath | Out-Host
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $xmlPath)) { throw "$Vendor catalog extraction failed." }
     }
-    if ($baseIds -contains 'PCI\VEN_1002&DEV_6760') {
-        [pscustomobject]@{Name='AMD Catalyst legacy graphics';Url='https://www2.ati.com/drivers/amd-catalyst-15.7.1-win10-64bit.exe';Publisher='Advanced Micro Devices|ATI Technologies';Note='Legacy Windows 10 package; Windows 11 and laptop switchable graphics are not guaranteed. Current Adrenalin is not a substitute for this legacy driver.'}
+    $catalog = ConvertFrom-DriverCatalogXml ([IO.File]::ReadAllText($xmlPath))
+    $script:OemCatalogs[$Vendor] = $catalog
+    return ,$catalog
+}
+
+function Select-OemDriverPack {
+    param([string]$Vendor,[xml]$Catalog,[string]$Model,[string[]]$SystemIds,[string]$Release)
+    $candidates = @()
+    $identity = @($SystemIds | Where-Object { $_ } | ForEach-Object { $_.Trim().ToUpperInvariant() })
+    switch ($Vendor) {
+        'Dell' {
+            foreach ($pack in @($Catalog.DriverPackManifest.DriverPackage)) {
+                if ($pack.type -ne 'win') { continue }
+                $os = @($pack.SupportedOperatingSystems.OperatingSystem | Where-Object {
+                    $_.osCode -eq 'Windows11' -and $_.osArch -eq 'x64' -and $_.osVendor -eq 'Microsoft' })
+                if (-not $os.Count) { continue }
+                $models = @($pack.SupportedSystems.Brand | ForEach-Object { $_.Model })
+                $match = @($models | Where-Object { ($identity -contains ([string]$_.systemID).ToUpperInvariant()) -or $_.name -eq $Model })
+                if (-not $match.Count) { continue }
+                $sha = @($pack.Cryptography.Hash | Where-Object { $_.algorithm -eq 'SHA256' } | ForEach-Object { $_.InnerText }) | Select-Object -First 1
+                $candidates += [pscustomobject]@{Name="Dell Windows 11 driver pack: $Model";Url=('https://downloads.dell.com/' + $pack.path);
+                    Publisher='Dell';Sha256=$sha;Date=[string]$pack.dateTime;ExactRelease=$true;Size=[long]$pack.size;
+                    ExtractKind='Dell';Note='Model-matched Windows 11 x64 driver pack. Driver INF installation only; no BIOS flashing.'}
+            }
+        }
+        'HP' {
+            $packs = @($Catalog.SelectNodes("//*[local-name()='SoftPaq']"))
+            foreach ($mapping in @($Catalog.SelectNodes("//*[local-name()='ProductOSDriverPack']"))) {
+                if ($mapping.Architecture -ne '64-bit' -or $mapping.OSName -notmatch '^Windows 11 ') { continue }
+                $boardIds = @(([string]$mapping.SystemId -split ',') | ForEach-Object { $_.Trim().ToUpperInvariant() })
+                if ($mapping.SystemName -ne $Model -and -not @($boardIds | Where-Object { $identity -contains $_ }).Count) { continue }
+                foreach ($pack in @($packs | Where-Object { $_.Id -eq $mapping.SoftPaqId })) {
+                    $candidates += [pscustomobject]@{Name=[string]$pack.Name;Url=[string]$pack.Url;Publisher='HP Inc\.|Hewlett-Packard';
+                        Sha256=[string]$pack.SHA256;Date=[string]$pack.DateReleased;ExactRelease=([string]$mapping.OSName -match [regex]::Escape($Release));
+                        Size=[long]$pack.Size;ExtractKind='HP';Note=('Model-matched driver pack: ' + $mapping.OSName + '. No Windows 10 fallback.')}
+                }
+            }
+        }
+        'Lenovo' {
+            foreach ($entry in @($Catalog.ModelList.Model)) {
+                if ($entry.arch -match 'ARM') { continue }
+                $types = @($entry.Types.Type | ForEach-Object { ([string]$_).ToUpperInvariant() })
+                if ($entry.name -ne $Model -and -not @($types | Where-Object { $identity -contains $_ }).Count) { continue }
+                foreach ($pack in @($entry.SCCM | Where-Object { $_.os -eq 'win11' -and $_.InnerText -notmatch 'arm64|aarch64' })) {
+                    $candidates += [pscustomobject]@{Name=('Lenovo Windows 11 driver pack: ' + $entry.name);Url=$pack.InnerText.Trim();
+                        Publisher='Lenovo';Sha256=[string]$pack.crc;Date=[string]$pack.date;ExactRelease=($pack.version -eq $Release -or $pack.version -eq '*');
+                        Size=0;ExtractKind='Lenovo';Note=('Model/type-matched Windows 11 driver pack, release ' + $pack.version + '. No BIOS package selected.')}
+                }
+            }
+        }
     }
+    return $candidates | Where-Object { $_.Sha256 -match '^[a-fA-F0-9]{64}$' -and (Test-OfficialDriverUrl $_.Url) } |
+        Sort-Object @{Expression={$_.ExactRelease};Descending=$true},@{Expression={try {[datetime]$_.Date} catch {[datetime]::MinValue}};Descending=$true} |
+        Select-Object -First 1
+}
+
+function Invoke-OemDriverCatalog {
+    param([object]$Computer,[string]$Cache,[string[]]$Ids)
+    $vendor = switch -Regex ($Computer.Manufacturer) {
+        'Dell' { 'Dell'; break }; 'HP|Hewlett' { 'HP'; break }; 'Lenovo' { 'Lenovo'; break }
+    }
+    if (-not $vendor) { Write-Host 'No supported model catalog for this manufacturer. Continuing with publisher/hardware-ID fallback.'; return }
+    $board = Get-CimInstance Win32_BaseBoard | Select-Object -First 1
+    $product = Get-CimInstance Win32_ComputerSystemProduct | Select-Object -First 1
+    $release = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').DisplayVersion
+    $systemIds = @([string]$Computer.SystemSKUNumber,[string]$board.Product,[string]$product.Version,[string]$Computer.Model)
+    if ($vendor -eq 'Lenovo' -and ([string]$Computer.Model).Length -ge 4) { $systemIds += ([string]$Computer.Model).Substring(0,4) }
+    Write-Host "Official catalog: $vendor | $($Computer.Model) | Windows 11 x64 $release"
+    $catalog = Get-OemDriverCatalog $vendor $Cache
+    $candidate = Select-OemDriverPack $vendor $catalog $Computer.Model $systemIds $release
+    if (-not $candidate) { Write-Warning "$vendor catalog has no matching Windows 11 x64 pack with SHA256. No older-OS pack was substituted."; return }
+    if (-not $candidate.ExactRelease) { Write-Warning 'No exact Windows release pack is available; using the latest vendor-listed Windows 11 pack for this model.' }
+    if ($candidate.Size) { Write-Host ('Selected model pack download: {0:N2} GB; retained for retries until driver terminal exit.' -f ($candidate.Size / 1GB)) }
+    Invoke-DirectDriverPackages $Ids $Cache -Candidates @($candidate)
 }
 
 function Invoke-DirectDriverPackages {
     param([string[]]$Ids,[string]$Cache,[object[]]$Candidates)
-    if (-not $PSBoundParameters.ContainsKey('Candidates')) { $Candidates = @(Get-DirectDriverCandidates $Ids) }
+    if (-not $Candidates) { return }
     foreach ($candidate in $Candidates) {
         try {
             if (-not (Test-OfficialDriverUrl $candidate.Url)) { throw 'Unsupported publisher source.' }
             Write-Host "Direct publisher candidate: $($candidate.Name)"
             Write-Warning $candidate.Note
             $hashProvider = [Security.Cryptography.SHA256]::Create()
-            try { $prefix = ([BitConverter]::ToString($hashProvider.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate.Url)))).Replace('-','').Substring(0,16) }
+            try { $prefix = ([BitConverter]::ToString($hashProvider.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate.Url + '|' + $candidate.Sha256)))).Replace('-','').Substring(0,16) }
             finally { $hashProvider.Dispose() }
             $name = $prefix + '-' + [IO.Path]::GetFileName(([uri]$candidate.Url).AbsolutePath)
             $archive = Join-Path $Cache $name
             $root = Join-Path $Cache ([IO.Path]::GetFileNameWithoutExtension($name))
+            if ((Test-Path -LiteralPath $root) -and ((Get-Item -LiteralPath $root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Driver package folder cannot be a link.' }
             $ready = Join-Path $root 'extract-ready.txt'
-            if (-not (Test-Path -LiteralPath $archive)) {
-                Get-Download $candidate.Url $archive -Publisher $candidate.Publisher -Headers @{Referer='https://www.amd.com/'}
+            $reuse = $false
+            if (Test-Path -LiteralPath $archive) {
+                try {
+                    if ($candidate.Sha256 -and (Get-FileHash -LiteralPath $archive).Hash -ne $candidate.Sha256) { throw 'Checksum mismatch.' }
+                    if ([IO.Path]::GetExtension($archive) -eq '.exe') {
+                        $sig = Get-AuthenticodeSignature -LiteralPath $archive
+                        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch $candidate.Publisher) { throw 'Publisher signature invalid.' }
+                    }
+                    $reuse = $true
+                } catch {
+                    Write-Warning 'Cached package is incomplete/invalid; downloading it again.'
+                    Remove-Item -LiteralPath $archive -Force
+                }
+            }
+            if (-not $reuse) {
+                $publisher = if ([IO.Path]::GetExtension($archive) -eq '.exe') { $candidate.Publisher } else { '' }
+                Get-Download $candidate.Url $archive -Publisher $publisher -Sha256 $candidate.Sha256
             } else {
-                $sig = Get-AuthenticodeSignature -LiteralPath $archive
-                if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch $candidate.Publisher) { throw 'Cached publisher signature invalid.' }
                 Write-Host 'Reusing previously downloaded publisher package.'
             }
             if (-not (Test-Path -LiteralPath $ready)) {
-                if (-not (Expand-DriverContainer $archive $root -TrustedPayload)) { throw 'Package format is not supported by the archive extractor.' }
-                # Read nested containers without executing their installer code.
+                $expanded = $false
+                if ($candidate.Sha256 -and [IO.Path]::GetExtension($archive) -eq '.exe' -and $candidate.ExtractKind -in @('Dell','HP','Lenovo')) {
+                    New-Item -ItemType Directory -Path $root -Force | Out-Null
+                    if ((Get-Item -LiteralPath $root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Driver pack extraction folder cannot be a link.' }
+                    $arguments = switch ($candidate.ExtractKind) {
+                        'Dell' { '/s /e="' + $root + '"' }
+                        'HP' { '/s /e /f "' + $root + '"' }
+                        'Lenovo' { '/VERYSILENT /NORESTART /DIR="' + $root + '" /EXTRACT="YES"' }
+                    }
+                    Write-Host 'Extracting the SHA256-verified OEM driver pack; its full setup is not being installed.'
+                    Invoke-Installer $archive $arguments 20
+                    $expanded = $true
+                } else {
+                    $expanded = Expand-DriverContainer $archive $root -TrustedPayload
+                }
+                if (-not $expanded) { throw 'Package format is not supported by the archive extractor.' }
+                # Extract nested containers; verified publisher extraction-only modes are allowed.
                 $seen = @{}
                 $count = 0
                 for ($depth=0; $depth -lt 5; $depth++) {
@@ -435,7 +565,11 @@ function Invoke-DirectDriverPackages {
                 Set-Content -LiteralPath $ready -Value 'Extraction completed'
             }
             Install-MatchingInfDrivers $root $Ids
-        } catch { Write-Warning "Direct package could not complete: $($_.Exception.Message)" }
+        } catch {
+            if ($_.Exception.Message -like 'Driver installation deferred:*') { throw }
+            Write-Warning "Direct package could not complete: $($_.Exception.Message)"
+            if ($null -ne $script:Results) { $script:Results.Add([pscustomobject]@{Step=('Driver package: ' + $candidate.Name);Status='Needs attention';Detail=$_.Exception.Message}) }
+        }
     }
 }
 
@@ -445,6 +579,7 @@ function Install-MatchingInfDrivers {
         Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) { throw 'Candidate contains linked files.' }
     foreach ($inf in @(Get-ChildItem -LiteralPath $Folder -Filter '*.inf' -Recurse -File)) {
         $text = Get-Content -LiteralPath $inf.FullName -Raw
+        if ($text -match '(?im)^\s*Class\s*=\s*"?Firmware"?\s*(?:;.*)?$') { continue }
         if (-not (Test-InfHardwareMatch $text $Ids)) { continue }
         $catalogs = @([regex]::Matches($text, '(?im)^\s*CatalogFile(?:\.[^=\s]+)?\s*=\s*([^;\r\n]+)') |
             ForEach-Object { $_.Groups[1].Value.Trim().Trim('"') })
@@ -578,7 +713,7 @@ function Get-DriverSearchPages {
 function Invoke-AutomaticWebDrivers {
     Show-DriverProblems
     Invoke-DriverRescan
-    Write-Host 'Searching the internet by hardware ID. No SDI and no Windows Update API.'
+    Write-Host 'Automatic official model catalogs first, then publisher/hardware-ID fallback. No SDI and no Windows Update API.'
     Write-Host 'Supported automatic packages: publisher INF packages, ZIP/CAB archives and verified extractable EXE containers. Only matching signed INF drivers are installed.'
     $computer = Get-CimInstance Win32_ComputerSystem
     $context = "$($computer.Manufacturer) $($computer.Model)"
@@ -589,10 +724,18 @@ function Invoke-AutomaticWebDrivers {
         if ((Get-Item -LiteralPath $part -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Hardware search cache cannot be a link.' }
     }
     if (-not $script:WebDriverSeen) { $script:WebDriverSeen = @{} }
+    $extractor = @((Join-Path $env:ProgramFiles '7-Zip\7z.exe'),(Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe')) |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $extractor) { Invoke-Step '7-Zip dependency for automatic driver extraction' { Install-WingetApp '7zip.7zip' } }
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
         Where-Object { $_.ConfigManagerErrorCode -ne 22 })
-    $allIds = @($devices | ForEach-Object { $_.HardwareID } | Where-Object { $_ } | Select-Object -Unique)
-    Invoke-DirectDriverPackages $allIds $cache
+    $inventory = @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 22 })
+    $allIds = @($inventory | ForEach-Object { @($_.HardwareID) + @($_.CompatibleID) } | Where-Object { $_ } | Select-Object -Unique)
+    try { Invoke-OemDriverCatalog $computer $cache $allIds } catch {
+        if ($_.Exception.Message -like 'Driver installation deferred:*') { throw }
+        Write-Warning "Official catalog lookup failed: $($_.Exception.Message)"
+        if ($null -ne $script:Results) { $script:Results.Add([pscustomobject]@{Step='Official driver catalog';Status='Needs attention';Detail=$_.Exception.Message}) }
+    }
     try { Invoke-VerifiedPublisherDrivers $allIds $cache } catch { Write-Warning "Publisher matching failed: $($_.Exception.Message)" }
     Invoke-DriverRescan
     $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' |
@@ -658,10 +801,16 @@ function Invoke-AutomaticWebDrivers {
                                 $script:WebDriverSeen[$url] = $folder
                             } else { $folder = $script:WebDriverSeen[$url]; Write-Host 'Reusing candidate already downloaded in this run.' }
                             Install-MatchingInfDrivers $folder $ids
-                        } catch { Write-Warning "Candidate failed: $($_.Exception.Message)" }
+                        } catch {
+                            if ($_.Exception.Message -like 'Driver installation deferred:*') { throw }
+                            Write-Warning "Candidate failed: $($_.Exception.Message)"
+                        }
                     }
                 }
-            } catch { Write-Warning "Internet search failed for $($ids[0]) : $($_.Exception.Message)" }
+            } catch {
+                if ($_.Exception.Message -like 'Driver installation deferred:*') { throw }
+                Write-Warning "Internet search failed for $($ids[0]) : $($_.Exception.Message)"
+            }
         }
     }
     Invoke-DriverRescan
@@ -956,7 +1105,7 @@ function Invoke-DriverWorkflow {
     Write-Host "`nDriver method:"
     Write-Host '1) SDIO automatic terminal'
     Write-Host '2) SDIO graphical interface'
-    Write-Host '3) Automatic hardware-ID driver search/download/install WITHOUT SDI'
+    Write-Host '3) Automatic official driver catalogs + hardware-ID fallback WITHOUT SDI'
     Write-Host '4) Original SDI graphical interface'
     do { $method = Read-Host 'Choose 1, 2, 3 or 4' } until ($method -in @('1','2','3','4'))
     $tool = switch ($method) { '1' { 'SDIO' }; '2' { 'SDIO' }; '3' { 'Internet hardware-ID search' }; '4' { 'SDI' } }
@@ -989,7 +1138,7 @@ function Invoke-DriverWorkflow {
         Write-Host "`n$tool has finished or closed. Are all drivers installed correctly?"
         Write-Host "1) Reopen the same tool ($tool) to check or retry."
         Write-Host '2) Switch between SDIO and original SDI.'
-        Write-Host '3) Automatic hardware-ID driver search/download/install WITHOUT SDI.'
+        Write-Host '3) Automatic official driver catalogs + hardware-ID fallback WITHOUT SDI.'
         Write-Host '4) Finish: drivers are OK.'
         Write-Host '5) Finish: some drivers still need attention.'
         Write-Host '6) Switch SDIO between automatic terminal and graphical interface'
