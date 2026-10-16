@@ -1045,20 +1045,19 @@ function Set-PowerProfile {
 
 
 function Invoke-DriverExclusive {
-    param([scriptblock]$Action)
+    param([scriptblock]$Action, [ValidateRange(0,300)][int]$WaitSeconds = 60)
     $mutex = New-Object Threading.Mutex($false, 'Local\FreshWindowsSetupDriverInstall')
     $locked = $false
     try {
         try { $locked = $mutex.WaitOne(0) }
         catch [Threading.AbandonedMutexException] { $locked = $true }
-        while (-not $locked) {
-            Write-Host 'Another setup terminal owns the driver installation lock. This installer has not started.'
-            Write-Host '1) Wait another 15 seconds'
-            Write-Host '2) Return to the retry/menu options without starting this installation'
-            do { $waitChoice = Read-Host 'Choose 1 or 2' } until ($waitChoice -in @('1','2'))
-            if ($waitChoice -eq '2') { throw 'Driver installation deferred: another terminal is busy. Retry after its installer finishes/closes.' }
-            try { $locked = $mutex.WaitOne(15000) }
+        if (-not $locked) {
+            Write-Host "Another driver installer is running. Waiting automatically for up to $WaitSeconds seconds; no input is needed."
+            try { $locked = $mutex.WaitOne($WaitSeconds * 1000) }
             catch [Threading.AbandonedMutexException] { $locked = $true }
+        }
+        if (-not $locked) {
+            throw [TimeoutException]::new('Driver installation deferred: another driver installer is still running. Continuing other setup work. After the setup windows close, use launcher option 6 for AMD/NVIDIA, 5 for drivers, or 7 to retry failed parts.')
         }
         Write-Host 'Driver installation lock acquired; starting this operation.'
         & $Action
@@ -1682,7 +1681,7 @@ namespace FreshWindowsSetup {
                 while (-not (Test-Path -LiteralPath $appPath) -and (Get-Date) -lt $deadline) {
                     Start-Sleep -Seconds 5
                 }
-                } catch { $silentFailed = $true; Write-Warning "Silent installer failed: $($_.Exception.Message)" }
+                } catch { if ($_.Exception -is [TimeoutException]) { throw }; $silentFailed = $true; Write-Warning "Silent installer failed: $($_.Exception.Message)" }
                 if ($silentFailed -or -not (Test-Path -LiteralPath $appPath)) {
                     Write-Host 'Silent installation did not produce the vendor app.'
                     Write-Host '1) Retry silent install'
