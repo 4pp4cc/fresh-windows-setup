@@ -231,29 +231,16 @@ function Save-SetupState {
     Write-Host "Last-run state retained: $path"
 }
 
-function Wait-FinalReviewPhase {
+function Mark-WorkerInteractive {
     if ($Worker -eq 'Coordinator' -or $script:FinalReviewOpen) { return }
     $ready = Join-Path $runDir ('ready-' + $Worker + '.txt')
-    Set-Content -LiteralPath $ready -Value 'Automatic work finished or requires final review'
-    $gate = Join-Path $runDir 'final-review.txt'
-    Write-Host 'Automatic phase paused for final review. Other terminals continue working; questions unlock after automatic cleanup.'
-    while (-not (Test-Path -LiteralPath $gate)) {
-        $ownerPath = Join-Path $runDir 'coordinator-process.txt'
-        if (Test-Path -LiteralPath $ownerPath) {
-            $ownerId = [int](Get-Content -LiteralPath $ownerPath -Raw)
-            if (-not (Get-Process -Id $ownerId -ErrorAction SilentlyContinue)) {
-                Write-Warning 'Coordinator exited. Opening this terminal for review.'
-                break
-            }
-        }
-        Start-Sleep -Seconds 1
-    }
+    Set-Content -LiteralPath $ready -Value 'Worker is ready for input; questions remain available immediately'
     $script:FinalReviewOpen = $true
 }
 
 function Read-Host {
     param([string]$Prompt,[switch]$AsSecureString)
-    Wait-FinalReviewPhase
+    Mark-WorkerInteractive
     Microsoft.PowerShell.Utility\Read-Host @PSBoundParameters
 }
 
@@ -1827,7 +1814,7 @@ try {
             Get-Process explorer -ErrorAction SilentlyContinue | Where-Object SessionId -eq $sessionId | Stop-Process -Force
             Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ArgumentList 'shell:MyComputerFolder'
         } }
-        Write-Host 'Automatic installations, removals and baseline tweaks are complete. Final choices and retry menus are now available.'
+        Write-Host 'Automatic installations, removals and baseline tweaks are complete. Final coordinator choices follow; worker retry menus remain independently available.'
         Set-Content -LiteralPath (Join-Path $runDir 'final-review.txt') -Value 'Automatic cleanup complete'
         if (-not $SkipDebloat) {
             Invoke-Step 'Final right-click menu preference' { Select-ContextMenuStyle }
