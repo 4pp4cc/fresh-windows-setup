@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 Manual post-install setup for Windows 11 x64. The Office-only option also runs
-on Windows 10 22H2 x64. Run in Windows PowerShell as
+on Windows 10 22H2 x86 or x64. Run in Windows PowerShell as
 administrator under the account whose desktop should be configured.
 No disk formatting or automatic reboot is performed.
 Keep this file beside Start-Setup.bat and double-click the BAT to launch.
@@ -67,8 +67,13 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
 $os = Get-CimInstance Win32_OperatingSystem
 $build = [int]$os.BuildNumber
 $officeOnly = $Part -eq 'Office' -and $Worker -in @('Coordinator','Office')
-if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
-    throw "Setup requires x64 Windows PowerShell. Detected process architecture: $env:PROCESSOR_ARCHITECTURE."
+$is64BitWindows = [Environment]::Is64BitOperatingSystem
+if ($is64BitWindows) {
+    if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+        throw "Setup requires x64 Windows PowerShell on 64-bit Windows. Detected process architecture: $env:PROCESSOR_ARCHITECTURE."
+    }
+} elseif (-not ($officeOnly -and $build -eq 19045 -and $env:PROCESSOR_ARCHITECTURE -eq 'x86')) {
+    throw 'On 32-bit Windows 10 22H2, only option 4 (Office) is available.'
 }
 if ($os.ProductType -ne 1 -or ($build -lt 22000 -and -not ($officeOnly -and $build -eq 19045))) {
     throw "Detected $($os.Caption), build $build. Setup requires Windows 11. On Windows 10 22H2, choose option 4 (Office)."
@@ -1826,7 +1831,8 @@ namespace FreshWindowsSetup {
     }
 
     if ($Worker -eq 'Office' -and -not $SkipOffice) {
-        Invoke-Step 'Office 2024 Pro Plus x64 pt-PT from original Microsoft C2R installer' {
+        $officePlatform = if ($is64BitWindows) { 'x64' } else { 'x86' }
+        Invoke-Step "Office 2024 Pro Plus $officePlatform pt-PT from original Microsoft C2R installer" {
             $configKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
             $existing = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
             $legacy = @(Get-LegacyOfficeSuite)
@@ -1835,7 +1841,7 @@ namespace FreshWindowsSetup {
             $provisionedOffice = @(Get-ProvisionedOffice)
             $hasOtherOffice = ($legacy.Count + $msi.Count + $storeOffice.Count + $provisionedOffice.Count) -gt 0
             if (-not $hasOtherOffice -and $existing.ProductReleaseIds -eq 'ProPlus2024Retail' -and
-                $existing.Platform -eq 'x64' -and $existing.ClientCulture -eq 'pt-pt' -and
+                $existing.Platform -eq $officePlatform -and $existing.ClientCulture -eq 'pt-pt' -and
                 $existing.InstallationPath -and
                 (Test-Path -LiteralPath (Join-Path $existing.InstallationPath 'root\Office16\WINWORD.EXE'))) {
                 $client = Join-Path $env:CommonProgramFiles 'Microsoft Shared\ClickToRun\OfficeC2RClient.exe'
@@ -1844,8 +1850,8 @@ namespace FreshWindowsSetup {
                 Write-Host 'Existing Office kept. Update requested; follow the Office update window for completion.'
                 return
             }
-            $setup = Join-Path $runDir 'Office2024-pt-PT-C2R.exe'
-            $url = 'https://c2rsetup.officeapps.live.com/c2r/download.aspx?ProductreleaseID=ProPlus2024Retail&platform=x64&language=pt-pt&version=O16GA'
+            $setup = Join-Path $runDir "Office2024-$officePlatform-pt-PT-C2R.exe"
+            $url = "https://c2rsetup.officeapps.live.com/c2r/download.aspx?ProductreleaseID=ProPlus2024Retail&platform=$officePlatform&language=pt-pt&version=O16GA"
             Get-Download $url $setup -Publisher 'Microsoft Corporation'
             if ($existing.ProductReleaseIds -or $hasOtherOffice) {
                 if (Get-Process WINWORD,EXCEL,POWERPNT,OUTLOOK,MSACCESS,MSPUB,ONENOTE,VISIO,WINPROJ -ErrorAction SilentlyContinue) {
@@ -1882,11 +1888,11 @@ namespace FreshWindowsSetup {
                     Join-Path $config.InstallationPath 'root\Office16\WINWORD.EXE'
                 } else { '' }
                 $ready = $config -and $config.ProductReleaseIds -eq 'ProPlus2024Retail' -and
-                    $config.Platform -eq 'x64' -and $config.ClientCulture -eq 'pt-pt' -and
+                    $config.Platform -eq $officePlatform -and $config.ClientCulture -eq 'pt-pt' -and
                     $word -and (Test-Path -LiteralPath $word)
                 if (-not $ready) { Start-Sleep -Seconds 10 }
             } until ($ready -or (Get-Date) -gt $deadline)
-            if (-not $ready) { throw 'Office x64 pt-PT installation could not be verified within 60 minutes. Check the Microsoft installer.' }
+            if (-not $ready) { throw "Office $officePlatform pt-PT installation could not be verified within 60 minutes. Check the Microsoft installer." }
             Write-Host 'Office product, architecture, language and Word executable detected. Office activation is separate.'
         }
         if (-not $SkipFinalCommand -and $script:Results[$script:Results.Count - 1].Status -eq 'Completed') {
