@@ -166,16 +166,47 @@ function Invoke-Installer {
     }
 }
 
-function Get-OfficeMsiProduct {
+function Get-OfficeUninstallEntry {
     foreach ($root in @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
     )) {
-        Get-ItemProperty "$root\*" -ErrorAction SilentlyContinue | Where-Object {
-            $_.WindowsInstaller -eq 1 -and $_.Publisher -eq 'Microsoft Corporation' -and
-            $_.PSChildName -match '^\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-0000000FF1CE\}$'
-        }
+        Get-ItemProperty "$root\*" -ErrorAction SilentlyContinue
     }
+}
+
+function Get-OfficeMsiProduct {
+    Get-OfficeUninstallEntry | Where-Object {
+        $_.WindowsInstaller -eq 1 -and
+        $_.PSChildName -match '^\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-0000000FF1CE\}$'
+    }
+}
+
+function Get-LegacyOfficeSuite {
+    Get-OfficeUninstallEntry | Where-Object {
+        $_.PSChildName -match '^Office(12|14|15|16)\.[A-Z0-9]+$' -and
+        ($_.Publisher -eq 'Microsoft Corporation' -or $_.UninstallString -match '\\Microsoft Shared\\OFFICE\d+\\Office Setup Controller\\setup\.exe"?\s+/uninstall\s+')
+    }
+}
+
+function Uninstall-LegacyOfficeSuite {
+    param($Suite)
+    $parts = $Suite.PSChildName -split '\.', 2
+    $version = $parts[0]
+    $edition = $parts[1]
+    $controllerPath = 'Microsoft Shared\{0}\Office Setup Controller\setup.exe' -f $version
+    $registered = [regex]::Match([string]$Suite.UninstallString, '(?i)^\s*"?([^"]+?\\setup\.exe)"?\s+/uninstall\s+')
+    $controller = @($env:CommonProgramFiles, ${env:CommonProgramFiles(x86)}) |
+        Where-Object { $_ } | ForEach-Object { Join-Path $_ $controllerPath } |
+        Where-Object { (Test-Path -LiteralPath $_) -and (-not $registered.Success -or $_ -eq $registered.Groups[1].Value) } |
+        Select-Object -First 1
+    if (-not $controller) { throw "Office Setup Controller is missing for $($Suite.DisplayName). Repair or uninstall it from Programs and Features, then retry." }
+    $signature = Get-AuthenticodeSignature -LiteralPath $controller
+    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+        throw "Could not verify the Office Setup Controller for $($Suite.DisplayName)."
+    }
+    Write-Host "Complete the uninstall for $($Suite.DisplayName) in the Office setup window."
+    Invoke-Installer $controller "/uninstall $edition"
 }
 
 function Get-ProvisionedOffice {
@@ -1798,10 +1829,11 @@ namespace FreshWindowsSetup {
         Invoke-Step 'Office 2024 Pro Plus x64 pt-PT from original Microsoft C2R installer' {
             $configKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
             $existing = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
+            $legacy = @(Get-LegacyOfficeSuite)
             $msi = @(Get-OfficeMsiProduct)
             $storeOffice = @(Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop)
             $provisionedOffice = @(Get-ProvisionedOffice)
-            $hasOtherOffice = ($msi.Count + $storeOffice.Count + $provisionedOffice.Count) -gt 0
+            $hasOtherOffice = ($legacy.Count + $msi.Count + $storeOffice.Count + $provisionedOffice.Count) -gt 0
             if (-not $hasOtherOffice -and $existing.ProductReleaseIds -eq 'ProPlus2024Retail' -and
                 $existing.Platform -eq 'x64' -and $existing.ClientCulture -eq 'pt-pt' -and
                 $existing.InstallationPath -and
@@ -1821,7 +1853,10 @@ namespace FreshWindowsSetup {
                 }
                 Write-Host 'Removing existing Office and Microsoft 365 products before installing Office 2024.'
                 if ($existing.ProductReleaseIds) { Remove-OfficeClickToRun }
-                foreach ($product in ($msi | Sort-Object PSChildName -Unique)) {
+                foreach ($suite in $legacy) {
+                    if (Test-Path -LiteralPath $suite.PSPath) { Uninstall-LegacyOfficeSuite $suite }
+                }
+                foreach ($product in (Get-OfficeMsiProduct | Sort-Object PSChildName -Unique)) {
                     if (-not (Get-OfficeMsiProduct | Where-Object PSChildName -eq $product.PSChildName)) { continue }
                     Write-Host "Removing $($product.DisplayName)"
                     Invoke-Installer "$env:SystemRoot\System32\msiexec.exe" "/x $($product.PSChildName) /passive /norestart"
@@ -1833,7 +1868,7 @@ namespace FreshWindowsSetup {
                     Remove-AppxPackage -AllUsers -Package $package.PackageFullName
                 }
                 $remaining = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
-                if ($remaining.ProductReleaseIds -or (Get-OfficeMsiProduct) -or
+                if ($remaining.ProductReleaseIds -or (Get-LegacyOfficeSuite) -or (Get-OfficeMsiProduct) -or
                     (Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop) -or (Get-ProvisionedOffice)) {
                     throw 'Office conflicts remain. Restart if requested, then retry Office setup.'
                 }
