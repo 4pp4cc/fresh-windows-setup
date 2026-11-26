@@ -7,8 +7,8 @@ No disk formatting or automatic reboot is performed.
 Keep this file beside Start-Setup.bat and double-click the BAT to launch.
 After verifying a restore point, it runs tweaks, apps, Office and drivers in four
 visible terminals. Run the same BAT again after Windows updates to reapply
-tweaks/remove returned bloatware and update apps. The Office worker removes
-conflicting Office installations or updates a matching installation. Close Office
+tweaks/remove returned bloatware and update apps. The Office worker keeps an
+existing Office 2024 Pro Plus installation and asks before removing a conflict. Close Office
 apps before setup and reboot only after all workers
 and vendor installers finish. Reports are under ProgramData\FreshWindowsSetup.
 
@@ -219,6 +219,7 @@ function Get-ProvisionedOffice {
 }
 
 function Remove-OfficeClickToRun {
+    param([ValidatePattern('^[A-Za-z0-9]+$')][string]$ProductId)
     $page = 'https://www.microsoft.com/en-us/download/details.aspx?id=49117'
     $html = (Invoke-WebRequest -Uri $page -UseBasicParsing).Content
     $download = [regex]::Match($html, 'https://download\.microsoft\.com/download/[a-fA-F0-9-]+/officedeploymenttool_[0-9-]+\.exe')
@@ -234,7 +235,7 @@ function Remove-OfficeClickToRun {
         throw 'Office Deployment Tool signature verification failed.'
     }
     $xml = Join-Path $toolDir 'RemoveOffice.xml'
-    '<Configuration><Remove All="TRUE" /><Display Level="Full" AcceptEULA="TRUE" /></Configuration>' |
+    ('<Configuration><Remove><Product ID="{0}" /></Remove><Display Level="Full" AcceptEULA="TRUE" /></Configuration>' -f $ProductId) |
         Set-Content -LiteralPath $xml -Encoding UTF8
     Invoke-Installer $tool ('/configure "{0}"' -f $xml)
 }
@@ -1834,66 +1835,110 @@ namespace FreshWindowsSetup {
         $officePlatform = if ($is64BitWindows) { 'x64' } else { 'x86' }
         Invoke-Step "Office 2024 Pro Plus $officePlatform pt-PT from original Microsoft C2R installer" {
             $configKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+            $targetId = 'ProPlus2024Retail'
+            $readProducts = {
+                param($Config)
+                ([string]$Config.ProductReleaseIds -split '[,;\s]+') | Where-Object { $_ }
+            }
             $existing = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
-            $legacy = @(Get-LegacyOfficeSuite)
-            $msi = @(Get-OfficeMsiProduct)
-            $storeOffice = @(Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop)
-            $provisionedOffice = @(Get-ProvisionedOffice)
-            $hasOtherOffice = ($legacy.Count + $msi.Count + $storeOffice.Count + $provisionedOffice.Count) -gt 0
-            if (-not $hasOtherOffice -and $existing.ProductReleaseIds -eq 'ProPlus2024Retail' -and
-                $existing.Platform -eq $officePlatform -and $existing.ClientCulture -eq 'pt-pt' -and
-                $existing.InstallationPath -and
-                (Test-Path -LiteralPath (Join-Path $existing.InstallationPath 'root\Office16\WINWORD.EXE'))) {
+            if ((& $readProducts $existing) -contains $targetId) {
+                Write-Host "Keeping existing Office 2024 Pro Plus ($($existing.Platform), $($existing.ClientCulture))."
                 $client = Join-Path $env:CommonProgramFiles 'Microsoft Shared\ClickToRun\OfficeC2RClient.exe'
-                if (-not (Test-Path -LiteralPath $client)) { throw 'Installed Office has no Click-to-Run update client.' }
+                if (-not (Test-Path -LiteralPath $client)) {
+                    throw 'Office 2024 is registered but its update client is missing. Repair it from Installed apps.'
+                }
                 Invoke-Installer $client '/update user displaylevel=true forceappshutdown=false updatepromptuser=false'
-                Write-Host 'Existing Office kept. Update requested; follow the Office update window for completion.'
+                Write-Host 'Update requested. Follow the Office update window for completion.'
                 return
             }
+
             $setup = Join-Path $runDir "Office2024-$officePlatform-pt-PT-C2R.exe"
             $url = "https://c2rsetup.officeapps.live.com/c2r/download.aspx?ProductreleaseID=ProPlus2024Retail&platform=$officePlatform&language=pt-pt&version=O16GA"
             Get-Download $url $setup -Publisher 'Microsoft Corporation'
-            if ($existing.ProductReleaseIds -or $hasOtherOffice) {
+            $installationReady = {
+                param($Config)
+                if ((& $readProducts $Config) -notcontains $targetId -or $Config.Platform -ne $officePlatform -or -not $Config.InstallationPath) {
+                    return $false
+                }
+                Test-Path -LiteralPath (Join-Path $Config.InstallationPath 'root\Office16\WINWORD.EXE')
+            }
+
+            while ($true) {
+                Write-Host 'Complete the Microsoft Office installer if it opens a window.'
+                $installerError = $null
+                try { Invoke-Installer $setup }
+                catch { $installerError = $_; Write-Warning $_.Exception.Message }
+
+                $current = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
+                if (& $installationReady $current) { $installerError = $null; break }
+                $products = @(& $readProducts $current | Where-Object { $_ -match '^[A-Za-z0-9]+$' -and $_ -notmatch '2024' })
+                $suites = @(Get-LegacyOfficeSuite)
+                $msi = @(Get-OfficeMsiProduct | Where-Object DisplayName | Sort-Object PSChildName -Unique)
+                $conflicts = @(
+                    foreach ($id in $products) { [pscustomobject]@{Name=$id; Kind='Click-to-Run'; Item=$id} }
+                    foreach ($suite in $suites) { [pscustomobject]@{Name=$suite.DisplayName; Kind='Office suite'; Item=$suite} }
+                    foreach ($app in $msi) { [pscustomobject]@{Name=$app.DisplayName; Kind='MSI'; Item=$app} }
+                    if ((Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop) -or (Get-ProvisionedOffice)) {
+                        [pscustomobject]@{Name='Microsoft Store desktop Office'; Kind='Store'; Item=$null}
+                    }
+                )
+
+                if (-not $conflicts.Count -or (& $readProducts $current) -contains $targetId) { break }
+                $decision = Read-Host 'Finish or close the Office installer. If Microsoft says an older Office product must be uninstalled, type REMOVE. Otherwise press Enter'
+                if ($decision -ne 'REMOVE') { break }
+                for ($index = 0; $index -lt $conflicts.Count; $index++) {
+                    $item = $conflicts[$index]
+                    Write-Host "$($index + 1)) $($item.Name) [$($item.Kind)]"
+                }
+                $number = 0
+                $selection = Read-Host 'Enter the number of the product named by Microsoft, or press Enter to cancel'
+                if (-not [int]::TryParse($selection, [ref]$number) -or $number -lt 1 -or $number -gt $conflicts.Count) { break }
+                $current = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
+                if ((& $readProducts $current) -contains $targetId) { break }
                 if (Get-Process WINWORD,EXCEL,POWERPNT,OUTLOOK,MSACCESS,MSPUB,ONENOTE,VISIO,WINPROJ -ErrorAction SilentlyContinue) {
                     throw 'Close open Office apps and retry Office setup.'
                 }
-                Write-Host 'Removing existing Office and Microsoft 365 products before installing Office 2024.'
-                if ($existing.ProductReleaseIds) { Remove-OfficeClickToRun }
-                foreach ($suite in $legacy) {
-                    if (Test-Path -LiteralPath $suite.PSPath) { Uninstall-LegacyOfficeSuite $suite }
-                }
-                foreach ($product in (Get-OfficeMsiProduct | Sort-Object PSChildName -Unique)) {
-                    if (-not (Get-OfficeMsiProduct | Where-Object PSChildName -eq $product.PSChildName)) { continue }
-                    Write-Host "Removing $($product.DisplayName)"
-                    Invoke-Installer "$env:SystemRoot\System32\msiexec.exe" "/x $($product.PSChildName) /passive /norestart"
-                }
-                foreach ($package in $provisionedOffice) {
-                    Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName | Out-Null
-                }
-                foreach ($package in (Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop)) {
-                    Remove-AppxPackage -AllUsers -Package $package.PackageFullName
-                }
-                $remaining = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
-                if ($remaining.ProductReleaseIds -or (Get-LegacyOfficeSuite) -or (Get-OfficeMsiProduct) -or
-                    (Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop) -or (Get-ProvisionedOffice)) {
-                    throw 'Office conflicts remain. Restart if requested, then retry Office setup.'
+
+                $conflict = $conflicts[$number - 1]
+                Write-Host "Removing $($conflict.Name)."
+                switch ($conflict.Kind) {
+                    'Click-to-Run' {
+                        Remove-OfficeClickToRun $conflict.Item
+                        $current = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
+                        if ((& $readProducts $current) -contains $conflict.Item) { throw "Removal of $($conflict.Name) could not be verified." }
+                    }
+                    'Office suite' {
+                        Uninstall-LegacyOfficeSuite $conflict.Item
+                        if (Test-Path -LiteralPath $conflict.Item.PSPath) { throw "Removal of $($conflict.Name) could not be verified." }
+                    }
+                    'MSI' {
+                        $code = $conflict.Item.PSChildName
+                        Invoke-Installer "$env:SystemRoot\System32\msiexec.exe" "/x $code /passive /norestart"
+                        if (Get-OfficeMsiProduct | Where-Object PSChildName -eq $code) { throw "Removal of $($conflict.Name) could not be verified." }
+                    }
+                    'Store' {
+                        Get-ProvisionedOffice | ForEach-Object {
+                            Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName | Out-Null
+                        }
+                        Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop | ForEach-Object {
+                            Remove-AppxPackage -AllUsers -Package $_.PackageFullName
+                        }
+                        if ((Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop) -or (Get-ProvisionedOffice)) {
+                            throw "Removal of $($conflict.Name) could not be verified."
+                        }
+                    }
                 }
             }
-            Write-Host 'Complete the Microsoft Office installer if it opens a window.'
-            Invoke-Installer $setup
+
+            if ($installerError) { throw $installerError }
             $deadline = (Get-Date).AddMinutes(60)
             do {
-                $config = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
-                $word = if ($config -and $config.InstallationPath) {
-                    Join-Path $config.InstallationPath 'root\Office16\WINWORD.EXE'
-                } else { '' }
-                $ready = $config -and $config.ProductReleaseIds -eq 'ProPlus2024Retail' -and
-                    $config.Platform -eq $officePlatform -and $config.ClientCulture -eq 'pt-pt' -and
-                    $word -and (Test-Path -LiteralPath $word)
+                $current = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
+                $ready = & $installationReady $current
                 if (-not $ready) { Start-Sleep -Seconds 10 }
             } until ($ready -or (Get-Date) -gt $deadline)
-            if (-not $ready) { throw "Office $officePlatform pt-PT installation could not be verified within 60 minutes. Check the Microsoft installer." }
-            Write-Host 'Office product, architecture, language and Word executable detected. Office activation is separate.'
+            if (-not $ready) { throw "Office $officePlatform installation could not be verified within 60 minutes. Check the Microsoft installer." }
+            Write-Host 'Office product, architecture and Word executable detected.'
         }
         if (-not $SkipFinalCommand -and $script:Results[$script:Results.Count - 1].Status -eq 'Completed') {
             Write-Host 'Open Word and follow the Microsoft activation prompts using your licensed account or product key.'
