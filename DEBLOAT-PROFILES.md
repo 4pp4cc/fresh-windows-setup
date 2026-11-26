@@ -4,7 +4,11 @@ Reviewed 16 October 2026. These are **4pp4cc's curated profiles**, not upstream 
 
 ## Workflow and preserved requirements
 
-Restore point first. The first debloat question selects **1 Normal / 2 High / 3 Radical**. Apps (including verified Chrome), Office, manufacturer catalogs and hardware-ID/SDI work use separate windows. Automatic removals and startup cleanup finish before final power/right-click choices. Radical service restrictions wait until installation/retry work finishes. The IRM window keeps its Ko-fi banner and offers 0 Exit, 1 All, 2 Debloat, 3 Software, 4 Office, 5 Drivers, 6 AMD/NVIDIA, 7 Failed/missing.
+Use `Start-Setup.bat` and choose **4 Office** or **6 AMD / NVIDIA / Intel utilities** to run one workflow. Setup registers **Run as administrator** for `.py` files for the signed-in user. On Windows 11, look under **Show more options**. The entry needs the Python launcher.
+
+The Office workflow updates a matching standalone Office 2024 installation. If it detects conflicting Click-to-Run, Windows Installer or Microsoft Store desktop Office packages, it removes them and checks again before launching the Office 2024 installer. After setup, open Word to activate using your Microsoft license.
+
+Restore point first. The first debloat question selects **1 Normal / 2 High / 3 Radical**. Apps (including verified Chrome), Office, manufacturer catalogs and hardware-ID/SDI work use separate windows. Automatic removals and startup cleanup finish before final power/right-click choices. Radical service restrictions wait until installation/retry work finishes.
 
 All levels preserve Edge/Chrome/Brave, the requested desktop software and Office 2024, Defender's Windows components, App Installer/WinGet, Terminal, Store's platform package, driver frameworks and selected OEM power-management tools. Right-click style is a separate final choice. Apps removed include their app data. User OneDrive folders are kept. Logs and run history are retained. Normal/High do not automatically undo previous Radical changes.
 

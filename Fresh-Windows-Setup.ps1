@@ -6,8 +6,9 @@ No disk formatting or automatic reboot is performed.
 Keep this file beside Start-Setup.bat and double-click the BAT to launch.
 After verifying a restore point, it runs tweaks, apps, Office and drivers in four
 visible terminals. Run the same BAT again after Windows updates to reapply
-tweaks/remove returned bloatware and update apps. Existing Office is updated,
-not reinstalled. Close Office apps for updates and reboot only after all workers
+tweaks/remove returned bloatware and update apps. The Office worker removes
+conflicting Office installations or updates a matching installation. Close Office
+apps before setup and reboot only after all workers
 and vendor installers finish. Reports are under ProgramData\FreshWindowsSetup.
 
 Created/customized by GZ / 4pp4cc. Support: https://ko-fi.com/gzred
@@ -15,8 +16,8 @@ Project: https://github.com/4pp4cc/fresh-windows-setup
 Credits: Raphire/Win11Debloat, Glenn Delahoy (SDIO), the original SDI project,
 and the respective software vendors. These projects are independent.
 WARNING: This script changes Windows settings, removes apps (including Xbox
-and OneDrive), installs drivers/software and launches the requested remote
-command. Review it first and keep a separate backup of important files.
+and OneDrive), and installs drivers/software. Review it first and keep a
+separate backup of important files.
 A restore point is required but is not a full backup. Provided AS IS with no
 guarantee or warranty. GPU signature checks may be bypassed for official
 vendor downloads as requested. Performance settings increase battery use.
@@ -158,6 +159,43 @@ function Invoke-Installer {
     if ($process.ExitCode -in @(3010,1641)) { Write-Warning 'Installer requests a restart.' }
     break
     }
+}
+
+function Get-OfficeMsiProduct {
+    foreach ($root in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )) {
+        Get-ItemProperty "$root\*" -ErrorAction SilentlyContinue | Where-Object {
+            $_.WindowsInstaller -eq 1 -and $_.Publisher -eq 'Microsoft Corporation' -and
+            $_.PSChildName -match '^\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-0000000FF1CE\}$'
+        }
+    }
+}
+
+function Get-ProvisionedOffice {
+    Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'Microsoft.Office.Desktop'
+}
+
+function Remove-OfficeClickToRun {
+    $page = 'https://www.microsoft.com/en-us/download/details.aspx?id=49117'
+    $html = (Invoke-WebRequest -Uri $page -UseBasicParsing).Content
+    $download = [regex]::Match($html, 'https://download\.microsoft\.com/download/[a-fA-F0-9-]+/officedeploymenttool_[0-9-]+\.exe')
+    if (-not $download.Success) { throw 'The official Office Deployment Tool download was not found.' }
+    $toolDir = Join-Path $runDir 'OfficeDeploymentTool'
+    New-Item -Path $toolDir -ItemType Directory -Force | Out-Null
+    $extractor = Join-Path $toolDir 'ODT.exe'
+    Get-Download $download.Value $extractor -Publisher 'Microsoft Corporation'
+    Invoke-Installer $extractor ('/quiet /extract:"{0}"' -f $toolDir)
+    $tool = Join-Path $toolDir 'setup.exe'
+    $signature = Get-AuthenticodeSignature -LiteralPath $tool
+    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+        throw 'Office Deployment Tool signature verification failed.'
+    }
+    $xml = Join-Path $toolDir 'RemoveOffice.xml'
+    '<Configuration><Remove All="TRUE" /><Display Level="Full" AcceptEULA="TRUE" /></Configuration>' |
+        Set-Content -LiteralPath $xml -Encoding UTF8
+    Invoke-Installer $tool ('/configure "{0}"' -f $xml)
 }
 
 function Set-Dword {
@@ -1044,7 +1082,7 @@ function Invoke-DriverExclusive {
             catch [Threading.AbandonedMutexException] { $locked = $true }
         }
         if (-not $locked) {
-            throw [TimeoutException]::new('Driver installation deferred: another driver installer is still running. Continuing other setup work. After the setup windows close, use launcher option 6 for AMD/NVIDIA, 5 for drivers, or 7 to retry failed parts.')
+            throw [TimeoutException]::new('Driver installation deferred: another driver installer is still running. Continuing other setup work. After the setup windows close, retry with option 5 for drivers or option 6 for AMD/NVIDIA/Intel utilities.')
         }
         Write-Host 'Driver installation lock acquired; starting this operation.'
         & $Action
@@ -1433,6 +1471,19 @@ try {
         Write-Host ('Selected debloat profile: ' + $script:DebloatProfile.Name)
     }
 
+    Invoke-Step 'Add Run as administrator to Python files' {
+        $launcher = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $python = if ($launcher) { $launcher.Source } else { Join-Path $env:SystemRoot 'py.exe' }
+        $verb = 'HKCU:\SOFTWARE\Classes\SystemFileAssociations\.py\shell\runas'
+        New-Item -Path $verb -Force | Out-Null
+        Set-Item -LiteralPath $verb -Value 'Run as administrator'
+        New-ItemProperty -LiteralPath $verb -Name HasLUAShield -Value '' -PropertyType String -Force | Out-Null
+        New-ItemProperty -LiteralPath $verb -Name MultiSelectModel -Value Single -PropertyType String -Force | Out-Null
+        New-Item -Path "$verb\command" -Force | Out-Null
+        Set-Item -LiteralPath "$verb\command" -Value ('"{0}" "%1"' -f $python)
+        if (-not $launcher) { Write-Host 'Install the Python launcher to use the new context menu entry.' }
+    }
+
     Invoke-Step 'WinGet availability' {
         if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
             # Microsoft's supported WinGet repair/bootstrap command.
@@ -1638,6 +1689,22 @@ namespace FreshWindowsSetup {
     }
 
     if (-not $SkipGpu) {
+        Invoke-Step 'Intel Driver & Support Assistant on Intel PCs' {
+            if (-not (Get-CimInstance Win32_Processor -Filter "Manufacturer='GenuineIntel'")) {
+                Write-Host 'Intel processor absent. Intel Driver & Support Assistant skipped.'
+                return
+            }
+            if (Get-Service -Name DSAService -ErrorAction SilentlyContinue) {
+                Write-Host 'Intel Driver & Support Assistant is already installed.'
+                return
+            }
+            $file = Join-Path $runDir 'Intel-Driver-and-Support-Assistant-Installer.exe'
+            Get-Download 'https://dsadata.intel.com/installer' $file -Publisher 'Intel Corporation'
+            Invoke-DriverExclusive { Invoke-Installer $file }
+            if (-not (Get-Service -Name DSAService -ErrorAction SilentlyContinue)) {
+                throw 'Intel Driver & Support Assistant service was not detected after setup.'
+            }
+        }
         Invoke-Step 'Detect GPU and launch appropriate vendor setup' {
             # PCI vendor IDs also work before a proper GPU driver has been installed.
             $adapters = @(Get-CimInstance Win32_VideoController)
@@ -1723,10 +1790,12 @@ namespace FreshWindowsSetup {
         Invoke-Step 'Office 2024 Pro Plus x64 pt-PT from original Microsoft C2R installer' {
             $configKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
             $existing = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
-            if ($existing -and $existing.ProductReleaseIds -notmatch 'ProPlus2024Retail') {
-                throw 'A different Click-to-Run Office product is installed. Resolve that conflict before installing this edition.'
-            }
-            if ($existing -and $existing.Platform -eq 'x64' -and $existing.ClientCulture -eq 'pt-pt' -and
+            $msi = @(Get-OfficeMsiProduct)
+            $storeOffice = @(Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop)
+            $provisionedOffice = @(Get-ProvisionedOffice)
+            $hasOtherOffice = ($msi.Count + $storeOffice.Count + $provisionedOffice.Count) -gt 0
+            if (-not $hasOtherOffice -and $existing.ProductReleaseIds -eq 'ProPlus2024Retail' -and
+                $existing.Platform -eq 'x64' -and $existing.ClientCulture -eq 'pt-pt' -and
                 $existing.InstallationPath -and
                 (Test-Path -LiteralPath (Join-Path $existing.InstallationPath 'root\Office16\WINWORD.EXE'))) {
                 $client = Join-Path $env:CommonProgramFiles 'Microsoft Shared\ClickToRun\OfficeC2RClient.exe'
@@ -1738,6 +1807,29 @@ namespace FreshWindowsSetup {
             $setup = Join-Path $runDir 'Office2024-pt-PT-C2R.exe'
             $url = 'https://c2rsetup.officeapps.live.com/c2r/download.aspx?ProductreleaseID=ProPlus2024Retail&platform=x64&language=pt-pt&version=O16GA'
             Get-Download $url $setup -Publisher 'Microsoft Corporation'
+            if ($existing.ProductReleaseIds -or $hasOtherOffice) {
+                if (Get-Process WINWORD,EXCEL,POWERPNT,OUTLOOK,MSACCESS,MSPUB,ONENOTE,VISIO,WINPROJ -ErrorAction SilentlyContinue) {
+                    throw 'Close open Office apps and retry Office setup.'
+                }
+                Write-Host 'Removing existing Office and Microsoft 365 products before installing Office 2024.'
+                if ($existing.ProductReleaseIds) { Remove-OfficeClickToRun }
+                foreach ($product in ($msi | Sort-Object PSChildName -Unique)) {
+                    if (-not (Get-OfficeMsiProduct | Where-Object PSChildName -eq $product.PSChildName)) { continue }
+                    Write-Host "Removing $($product.DisplayName)"
+                    Invoke-Installer "$env:SystemRoot\System32\msiexec.exe" "/x $($product.PSChildName) /passive /norestart"
+                }
+                foreach ($package in $provisionedOffice) {
+                    Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName | Out-Null
+                }
+                foreach ($package in (Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop)) {
+                    Remove-AppxPackage -AllUsers -Package $package.PackageFullName
+                }
+                $remaining = Get-ItemProperty $configKey -ErrorAction SilentlyContinue
+                if ($remaining.ProductReleaseIds -or (Get-OfficeMsiProduct) -or
+                    (Get-AppxPackage -AllUsers -Name Microsoft.Office.Desktop) -or (Get-ProvisionedOffice)) {
+                    throw 'Office conflicts remain. Restart if requested, then retry Office setup.'
+                }
+            }
             Write-Host 'Complete the Microsoft Office installer if it opens a window.'
             Invoke-Installer $setup
             $deadline = (Get-Date).AddMinutes(60)
@@ -1746,7 +1838,7 @@ namespace FreshWindowsSetup {
                 $word = if ($config -and $config.InstallationPath) {
                     Join-Path $config.InstallationPath 'root\Office16\WINWORD.EXE'
                 } else { '' }
-                $ready = $config -and $config.ProductReleaseIds -match 'ProPlus2024Retail' -and
+                $ready = $config -and $config.ProductReleaseIds -eq 'ProPlus2024Retail' -and
                     $config.Platform -eq 'x64' -and $config.ClientCulture -eq 'pt-pt' -and
                     $word -and (Test-Path -LiteralPath $word)
                 if (-not $ready) { Start-Sleep -Seconds 10 }
@@ -1754,35 +1846,8 @@ namespace FreshWindowsSetup {
             if (-not $ready) { throw 'Office x64 pt-PT installation could not be verified within 60 minutes. Check the Microsoft installer.' }
             Write-Host 'Office product, architecture, language and Word executable detected. Office activation is separate.'
         }
-        if (-not $SkipFinalCommand) {
-            Read-Host 'Close the Office installer/update window, then press Enter to run the requested activation command' | Out-Null
-            Invoke-Step 'Requested command after Office setup closes' {
-                Write-Host 'Opening the requested command in a separate elevated PowerShell window. Complete its menu and close that window to continue.'
-                $activationScript = Join-Path $runDir 'Requested-Activation.ps1'
-                @'
-$ErrorActionPreference = 'Stop'
-$activationLog = Join-Path $PSScriptRoot 'activation.log'
-try {
-    irm https://get.activated.win | iex
-    'Requested command returned; activation status was not verified.' | Add-Content -LiteralPath $activationLog
-    Read-Host 'Requested command returned. Press Enter to close this window' | Out-Null
-    exit 0
-} catch {
-    $_ | Out-String | Add-Content -LiteralPath $activationLog
-    Write-Warning ('Requested command failed or was blocked: ' + $_.Exception.Message)
-    Write-Host 'Review Windows Security > Protection history. This setup does not hide the command or bypass Defender.'
-    Write-Host ('Details retained in: ' + $activationLog)
-    Read-Host 'Press Enter to close this window and return to Office setup' | Out-Null
-    exit 1
-}
-'@ | Set-Content -LiteralPath $activationScript -Encoding UTF8
-                $commandProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-                    -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $activationScript + '"') -PassThru
-                $commandProcess.WaitForExit()
-                $commandProcess.Refresh()
-                if ($commandProcess.ExitCode -ne 0) { throw "Requested command window returned $($commandProcess.ExitCode). Review its displayed error." }
-                Write-Host 'Requested command window closed. This records process completion, not successful activation.'
-            }
+        if (-not $SkipFinalCommand -and $script:Results[$script:Results.Count - 1].Status -eq 'Completed') {
+            Write-Host 'Open Word and follow the Microsoft activation prompts using your licensed account or product key.'
         }
     }
     if ($Worker -eq 'Coordinator') {
