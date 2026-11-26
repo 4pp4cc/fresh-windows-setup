@@ -1,6 +1,7 @@
 #requires -Version 5.1
 <#
-Manual post-install setup for Windows 11 x64. Run in Windows PowerShell as
+Manual post-install setup for Windows 11 x64. The Office-only option also runs
+on Windows 10 22H2 x64. Run in Windows PowerShell as
 administrator under the account whose desktop should be configured.
 No disk formatting or automatic reboot is performed.
 Keep this file beside Start-Setup.bat and double-click the BAT to launch.
@@ -64,9 +65,13 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
     throw 'Open Windows PowerShell as administrator, then run this script again.'
 }
 $os = Get-CimInstance Win32_OperatingSystem
-if ([int]$os.BuildNumber -lt 22000 -or -not [Environment]::Is64BitProcess -or
-    $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
-    throw 'This script targets Windows 11 on an x64 PC.'
+$build = [int]$os.BuildNumber
+$officeOnly = $Part -eq 'Office' -and $Worker -in @('Coordinator','Office')
+if (-not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+    throw "Setup requires x64 Windows PowerShell. Detected process architecture: $env:PROCESSOR_ARCHITECTURE."
+}
+if ($os.ProductType -ne 1 -or ($build -lt 22000 -and -not ($officeOnly -and $build -eq 19045))) {
+    throw "Detected $($os.Caption), build $build. Setup requires Windows 11. On Windows 10 22H2, choose option 4 (Office)."
 }
 # Reject elevation under a different account: HKCU would configure the wrong desktop.
 $sessionId = (Get-Process -Id $PID).SessionId
@@ -1485,6 +1490,7 @@ try {
     }
 
     Invoke-Step 'WinGet availability' {
+        if ($officeOnly) { return }
         if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
             # Microsoft's supported WinGet repair/bootstrap command.
             Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
@@ -1498,14 +1504,16 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'WinGet source refresh failed.' }
     }
 
-    Invoke-Step 'Edge default-browser preference and direct setup links' { Set-EdgeDefaultPreference }
+    if (-not $officeOnly) {
+        Invoke-Step 'Edge default-browser preference and direct setup links' { Set-EdgeDefaultPreference }
+    }
     # Workers inherit the elevated token and each get a visible, separate console.
     foreach ($kind in @('Apps','Office','Drivers','Manufacturer')) {
         if ($kind -eq 'Office' -and $SkipOffice) { continue }
         if ($kind -in @('Drivers','Manufacturer') -and $SkipDrivers) { continue }
         if ($kind -eq 'Apps' -and $SkipApps -and $SkipGpu -and $SkipNetTime) { continue }
         Invoke-Step "Start $kind terminal" {
-            $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Worker ' + $kind + ' -RunRoot "' + $runDir + '"'
+            $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Worker ' + $kind + ' -Part ' + $Part + ' -RunRoot "' + $runDir + '"'
             foreach ($flag in @('SkipApps','SkipGpu','SkipNetTime','SkipOffice','SkipDrivers','SkipFinalCommand')) {
                 if ($script:SetupParameters.ContainsKey($flag) -and $script:SetupParameters[$flag]) { $arguments += " -$flag" }
             }
